@@ -31,8 +31,7 @@ from pathlib import Path
 
 import serial
 
-from hexapod_ik import HexapodIK
-from tripod_gait import TripodGait
+from kinematics import HexapodIK, TripodGait
 
 PORT = "/dev/ttyUSB0"
 BAUD = 9600
@@ -56,54 +55,51 @@ WALK_STAND_MOVE_TIME_MS = 800  # 启动/停止时回到自然站立的移动时�
 
 # ---------------------------------------------------------------- 内置数据
 
+# stand 与 walk 共享同一 IK/步态实例：避免每次命令都重新解析
+# physical_config.json，也保证两处使用的物理参数完全一致。
+IK = HexapodIK()
+GAIT = TripodGait(ik=IK)
+
+
 def natural_stand_pose() -> dict[int, int]:
-    """自然站立姿态：由 IK 按 physical_config.json 生成。
-
-    与 cmd_walk 使用同一套中立足端（含 5° 前偏），保证 stand -> walk
-    -> 停止之间姿态连续、无跳变。
-    """
-    return {
-        int(sid): int(round(pos))
-        for sid, pos in TripodGait(ik=HexapodIK()).stand_pose().items()
-    }
+    """自然站立姿态：由 IK 按 physical_config.json 生成（含 5° 前偏）。"""
+    return {int(sid): int(round(pos)) for sid, pos in GAIT.stand_pose().items()}
 
 
-FLATTEN_POSE = {
-    # leg1 = 左后
-    1: 512, 2: 512, 3: 512,
-    # leg2 = 左中
-    4: 512, 5: 512, 6: 512,
-    # leg3 = 左前
-    7: 512, 8: 512, 9: 512,
-    # leg4 = 右后
-    10: 512, 11: 512, 12: 512,
-    # leg5 = 右中
-    13: 512, 14: 512, 15: 512,
-    # leg6 = 右前
-    16: 512, 17: 512, 18: 512,
-}
+# 展平姿态：所有舵机回到中位 512
+FLATTEN_POSE = {sid: 512 for sid in SERVO_IDS}
 
 # ---------------------------------------------------------------- 串口协议
+
+def iter_frames(data: bytes):
+    """按 0x55 0x55 帧头与长度字段切出数据流中的完整帧。"""
+    i = 0
+    n = len(data)
+    while i + 3 <= n:
+        if data[i : i + 2] == FRAME_HEADER:
+            end = i + 2 + data[i + 2]
+            if end <= n:
+                yield data[i:end]
+                i = end
+                continue
+        i += 1
+
 
 def send_frame(ser: serial.Serial, cmd: int, params: list[int],
                wait_s: float = 0.35, timeout_s: float = 0.02) -> bytes:
     """发送指令并读取应答，在数据流中找一条完整有效应答帧后返回。"""
     frame = bytes([0x55, 0x55, len(params) + 2, cmd]) + bytes(params)
-    n_servos = params[0] if cmd == CMD_MULT_SERVO_POS_READ and params else None
 
-    def valid_frame(data: bytes):
-        i = 0
-        while i + 3 <= len(data):
-            if data[i : i + 2] == FRAME_HEADER:
-                length = data[i + 2]
-                end = i + 2 + length
-                if end <= len(data) and data[i + 3] == cmd:
-                    if cmd == CMD_MULT_SERVO_POS_READ:
-                        if length == n_servos * 3 + 3 and data[i + 4] == n_servos:
-                            return data[:end]
-                    elif cmd == CMD_MULT_SERVO_UNLOAD and length == len(params) + 3:
-                        return data[:end]
-            i += 1
+    def valid_response(data: bytes):
+        n_servos = params[0] if params else 0
+        for candidate in iter_frames(data):
+            if len(candidate) < 4 or candidate[3] != cmd:
+                continue
+            if cmd == CMD_MULT_SERVO_POS_READ:
+                if candidate[2] == n_servos * 3 + 3 and candidate[4] == n_servos:
+                    return candidate
+            else:
+                return candidate
         return None
 
     old_timeout = ser.timeout
@@ -118,7 +114,7 @@ def send_frame(ser: serial.Serial, cmd: int, params: list[int],
             chunk = ser.read(4096)
             if chunk:
                 data += chunk
-                found = valid_frame(data)
+                found = valid_response(data)
                 if found is not None:
                     return found
         return data
@@ -144,30 +140,14 @@ def drain_until_quiet(ser: serial.Serial, quiet_s: float = 0.02,
         ser.timeout = old_timeout
 
 
-def find_frames(data: bytes):
-    """按 0x55 0x55 帧头切出完整帧。"""
-    frames = []
-    i = 0
-    while i + 3 < len(data):
-        if data[i : i + 2] == FRAME_HEADER:
-            length = data[i + 2]
-            end = i + 2 + length
-            if end <= len(data):
-                frames.append(data[i:end])
-                i = end
-                continue
-        i += 1
-    return frames
-
-
 def read_servos(ser: serial.Serial, ids: list[int],
                 wait_s: float = 0.35) -> list[tuple[int, int]]:
     """读取多个舵机的位置，返回 [(舵机ID, 位置)]。"""
     params = [len(ids)] + ids
     data = send_frame(ser, CMD_MULT_SERVO_POS_READ, params, wait_s=wait_s)
     result = []
-    for frame in find_frames(data):
-        if frame[3] != CMD_MULT_SERVO_POS_READ or frame[4] != len(ids):
+    for frame in iter_frames(data):
+        if len(frame) < 5 or frame[3] != CMD_MULT_SERVO_POS_READ or frame[4] != len(ids):
             continue
         i = 5
         for _ in range(frame[4]):
@@ -322,8 +302,10 @@ def cmd_walk(ser: serial.Serial, speed_mm_s: float, stride_mm: float | None = No
         return
     speed = max(-WALK_SPEED_LIMIT, min(WALK_SPEED_LIMIT, speed))
 
-    gait = TripodGait(ik=HexapodIK(), stride=WALK_STRIDE_DEFAULT)
-    if stride_mm is not None:
+    gait = GAIT
+    if stride_mm is None:
+        gait.stride = WALK_STRIDE_DEFAULT
+    else:
         try:
             gait.stride = float(stride_mm)
         except (TypeError, ValueError):
@@ -404,6 +386,16 @@ def print_help():
     )
 
 
+def _parse_float_arg(tokens: list[str], index: int,
+                     name: str) -> tuple[float | None, str | None]:
+    """把 tokens[index] 解析为 float，失败返回 (None, 错误提示)。"""
+    raw = tokens[index]
+    try:
+        return float(raw), None
+    except ValueError:
+        return None, f"无效的{name}: {raw!r}"
+
+
 def run_repl(ser: serial.Serial, move_time_ms: int):
     print("Spiderbot 舵机驱动程序已启动。输入命令（help 查看帮助，quit 退出）。\n")
     while True:
@@ -415,47 +407,43 @@ def run_repl(ser: serial.Serial, move_time_ms: int):
 
         if not line:
             continue
+        tokens = line.split()
+        command = tokens[0]
         try:
-            if line in ("read", "r") or line.startswith(("read ", "r ")):
-                parts = line.split()
-                if len(parts) > 1:
-                    try:
-                        interval = float(parts[1])
-                    except ValueError:
-                        print(f"无效的刷新间隔: {parts[1]!r}")
+            if command in ("read", "r"):
+                interval = 0.1
+                if len(tokens) > 1:
+                    interval, error = _parse_float_arg(tokens, 1, "刷新间隔")
+                    if error:
+                        print(error)
                         continue
                     if not math.isfinite(interval) or interval < 0:
-                        print(f"无效的刷新间隔: {parts[1]!r}（必须为有限的非负数）")
+                        print(f"无效的刷新间隔: {tokens[1]!r}（必须为有限的非负数）")
                         continue
-                else:
-                    interval = 0.1
                 monitor_servos(ser, SERVO_IDS, interval)
-            elif line in ("stand", "s"):
+            elif command in ("stand", "s") and len(tokens) == 1:
                 cmd_pose(ser, "站立", natural_stand_pose(), move_time_ms)
-            elif line in ("flatten", "f"):
+            elif command in ("flatten", "f") and len(tokens) == 1:
                 cmd_pose(ser, "展平", FLATTEN_POSE, move_time_ms)
-            elif line in ("walk", "w") or line.startswith(("walk ", "w ")):
-                parts = line.split()
+            elif command in ("walk", "w"):
                 speed = WALK_SPEED_DEFAULT
                 stride = None
-                if len(parts) > 1:
-                    try:
-                        speed = float(parts[1])
-                    except ValueError:
-                        print(f"无效的速度: {parts[1]!r}")
+                if len(tokens) > 1:
+                    speed, error = _parse_float_arg(tokens, 1, "速度")
+                    if error:
+                        print(error)
                         continue
-                if len(parts) > 2:
-                    try:
-                        stride = float(parts[2])
-                    except ValueError:
-                        print(f"无效的步幅: {parts[2]!r}")
+                if len(tokens) > 2:
+                    stride, error = _parse_float_arg(tokens, 2, "步幅")
+                    if error:
+                        print(error)
                         continue
                 cmd_walk(ser, speed, stride)
-            elif line == "relax":
+            elif command == "relax" and len(tokens) == 1:
                 cmd_relax(ser)
-            elif line in ("help", "h", "?"):
+            elif command in ("help", "h", "?") and len(tokens) == 1:
                 print_help()
-            elif line in ("quit", "exit", "q"):
+            elif command in ("quit", "exit", "q") and len(tokens) == 1:
                 break
             else:
                 print(f"未知命令: {line!r}（输入 help 查看可用命令）")
