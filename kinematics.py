@@ -36,13 +36,22 @@ theta0 按腿分别取值：以各腿髋舵机的安装朝向（位置 512 时�
     natural - stride/2，z 恒为 -H。
   - 摆动相 0.5 <= u < 1：足端从 natural - stride/2 前进到
     natural + stride/2，z = -H + step_height*sin(pi*v) 抬起。
-  - stride 带符号：正数前进、负数后退；step_height 始终为抬起的幅值。
-    时间映射由调用方决定：周期 T = 2*stride/speed。这样支撑相内身体前进
+  - stride 为身体 x 向（前后）的带符号步幅：正数前进、负数后退；
+    lateral_stride 为身体 y 向（左右）的带符号步幅：正数向左、负数向右。
+    两者可以同时给出，用来合成任意水平方向的平移；step_height 始终为
+    抬起的幅值。
+  - 时间映射由调用方决定：周期 T = 2*|步幅|/speed。这样支撑相内身体前进
     stride、足端相对身体后退 stride，足端在地面不打滑。
+
+原地旋转（turn_feet_at/turn_pose_at）：
+  - turn_step 为每个完整步态周期身体绕 z 轴旋转的角度（弧度），正数表示
+    俯视逆时针（向左），负数表示顺时针（向右）。
+  - 足端在支撑相内相对身体从 +turn_step/2 反向旋转到 -turn_step/2；
+    摆动相抬脚并沿身体旋转方向转回 +turn_step/2。
 
 本模块只负责生成足端轨迹和舵机姿态，不负责串口与步态时间调度；
 启动时的自然站立姿态和约 1.5 个周期的步幅平滑爬升由 servo_driver 的
-walk 命令完成。
+walk / strafe / turn 命令完成。
 """
 
 from __future__ import annotations
@@ -69,6 +78,13 @@ class UnreachableFootError(ValueError):
 
 def _clamp(value: float, low: float, high: float) -> float:
     return low if value < low else high if value > high else value
+
+
+def _rotate_xy(x: float, y: float, angle: float) -> tuple[float, float]:
+    """把平面点 (x, y) 绕原点旋转 angle 弧度（俯视逆时针为正）。"""
+    cos_a = math.cos(angle)
+    sin_a = math.sin(angle)
+    return x * cos_a - y * sin_a, x * sin_a + y * cos_a
 
 
 class HexapodIK:
@@ -365,31 +381,90 @@ class TripodGait:
 
     # ------------------------------------------------------------- 步态轨迹
 
+    def _leg_phase(self, leg_id: int, phase: float) -> float:
+        """返回给定全局相位下该腿自身的归一化相位 u。"""
+        return (phase - self.offsets[int(leg_id)]) % 1.0
+
     def feet_at(
-        self, phase: float, stride: float | None = None
+        self,
+        phase: float,
+        stride: float | None = None,
+        lateral_stride: float = 0.0,
     ) -> dict[int, tuple[float, float, float]]:
-        """给定全局相位（周期归一化到 [0, 1)），返回 6 条腿的足端。"""
+        """给定全局相位（周期归一化到 [0, 1)），返回 6 条腿的足端。
+
+        stride 沿身体 x 轴：正数前进、负数后退；lateral_stride 沿身体 y 轴：
+        正数向左、负数向右。两者可同时使用，合成任意水平方向的平移。
+        """
         stride_now = self.stride if stride is None else float(stride)
+        lateral_now = float(lateral_stride)
         phase = phase % 1.0
         feet: dict[int, tuple[float, float, float]] = {}
         for leg_id in self.leg_ids:
-            u = (phase - self.offsets[leg_id]) % 1.0
+            u = self._leg_phase(leg_id, phase)
             neutral_x, neutral_y, neutral_z = self.neutral_foot(leg_id)
             if u < 0.5:
                 # 支撑相：足端相对身体从 +stride/2 线性后退到 -stride/2
                 progress = u / 0.5
                 x = neutral_x + stride_now * (0.5 - progress)
+                y = neutral_y + lateral_now * (0.5 - progress)
                 z = neutral_z
             else:
                 # 摆动相：足端前进，并按正弦弧线抬起
                 v = (u - 0.5) / 0.5
                 x = neutral_x - stride_now / 2 + stride_now * v
+                y = neutral_y - lateral_now / 2 + lateral_now * v
                 z = -self.body_height + self.step_height * math.sin(math.pi * v)
-            feet[leg_id] = (x, neutral_y, z)
+            feet[leg_id] = (x, y, z)
         return feet
 
     def pose_at(
-        self, phase: float, stride: float | None = None
+        self,
+        phase: float,
+        stride: float | None = None,
+        lateral_stride: float = 0.0,
     ) -> dict[int, float]:
-        """给定相位返回 18 个舵机位置（按舵机 ID 排序）。"""
-        return self.ik.solve_all(self.feet_at(phase, stride))
+        """给定相位返回 18 个舵机位置（按舵机 ID 排序）。
+
+        stride 与 lateral_stride 分别控制身体前后/左右平移，含义与
+        feet_at 相同。
+        """
+        return self.ik.solve_all(
+            self.feet_at(phase, stride, lateral_stride)
+        )
+
+    def turn_feet_at(
+        self, phase: float, turn_step: float
+    ) -> dict[int, tuple[float, float, float]]:
+        """给定全局相位与每周期旋转角，返回原地旋转时的 6 条腿足端。
+
+        turn_step 为每个完整步态周期内身体绕 z 轴旋转的角度（弧度）：
+        正数表示俯视逆时针（向左）旋转，负数表示顺时针（向右）。
+        足端相位规则与平移步态相同：支撑相内足端相对身体从 +turn_step/2
+        反向旋转到 -turn_step/2，摆动相抬脚并转回 +turn_step/2，保证足端
+        相对地面不打滑。
+        """
+        phase = phase % 1.0
+        feet: dict[int, tuple[float, float, float]] = {}
+        for leg_id in self.leg_ids:
+            u = self._leg_phase(leg_id, phase)
+            neutral_x, neutral_y, neutral_z = self.neutral_foot(leg_id)
+            if u < 0.5:
+                # 支撑相：足端相对身体从 +turn_step/2 转到 -turn_step/2
+                progress = u / 0.5
+                foot_angle = turn_step * (0.5 - progress)
+                z = neutral_z
+            else:
+                # 摆动相：足端沿身体旋转方向转回 +turn_step/2，并抬起
+                v = (u - 0.5) / 0.5
+                foot_angle = -turn_step / 2 + turn_step * v
+                z = -self.body_height + self.step_height * math.sin(math.pi * v)
+            x, y = _rotate_xy(neutral_x, neutral_y, foot_angle)
+            feet[leg_id] = (x, y, z)
+        return feet
+
+    def turn_pose_at(
+        self, phase: float, turn_step: float
+    ) -> dict[int, float]:
+        """给定相位与每周期旋转角，返回原地旋转的 18 个舵机位置。"""
+        return self.ik.solve_all(self.turn_feet_at(phase, turn_step))

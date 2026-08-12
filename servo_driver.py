@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Spiderbot 六足机器人舵机驱动程序（统一交互控制台）。
 
-把「读取位置」「站立」「展平」三个功能整合到一个程序里。
+把「读取位置」「站立」「展平」「步态行走/横移」等功能整合到一个程序里。
 启动后在控制台输入命令：
 
   read     持续读取 1-18 号舵机位置并覆盖打印，无响应自动重试（Ctrl+C 停止）
   stand    让机器人站立（内置站立姿态）
   flatten  让机器人展平（内置展平姿态）
   walk     以三角步态行走，可选速度 mm/s 与步幅 mm（默认 30 / 60，正数前进、负数后退）
+  strafe   以三角步态横向移动，可选速度 mm/s 与步幅 mm（默认 30 / 60，正数左移、负数右移）
+  turn     原地旋转，可选角速度 deg/s 与单周期转角 deg（默认 20 / 10，正数左转、负数右转）
   relax    卸载所有舵机（失能，可手动转动）
   help     显示本帮助
   quit     退出程序（退出前自动失能全部舵机）
@@ -49,13 +51,18 @@ CONFIG_PATH = Path(__file__).resolve().with_name("physical_config.json")
 WALK_SPEED_DEFAULT = 30.0      # mm/s，正数前进、负数后退
 WALK_SPEED_LIMIT = 90.0        # mm/s
 WALK_STRIDE_DEFAULT = 60.0     # mm，足端在每个支撑/摆动相内扫过的距离（前后各摆 stride/2）
+STRAFE_SPEED_DEFAULT = WALK_SPEED_DEFAULT
+STRAFE_STRIDE_DEFAULT = 60.0   # mm，横向移动时足端在每个支撑/摆动相内扫过的左右距离
+TURN_SPEED_DEFAULT = 20.0      # deg/s，正数俯视逆时针（左转）、负数右转
+TURN_SPEED_LIMIT = 30.0        # deg/s
+TURN_STEP_DEFAULT = 10.0       # deg，每个步态周期身体旋转的角度（左右各转 step/2）
 WALK_FRAME_PERIOD = 0.10       # s，帧周期
 WALK_MOVE_TIME_MS = 90         # 每帧舵机移动时间，适配 9600 串口带宽
 WALK_STAND_MOVE_TIME_MS = 800  # 启动/停止时回到自然站立的移动时间
 
 # ---------------------------------------------------------------- 内置数据
 
-# stand 与 walk 共享同一 IK/步态实例：避免每次命令都重新解析
+# stand、walk、strafe 与 turn 共享同一 IK/步态实例：避免每次命令都重新解析
 # physical_config.json，也保证两处使用的物理参数完全一致。
 IK = HexapodIK()
 GAIT = TripodGait(ik=IK)
@@ -285,16 +292,18 @@ def quantize_pose(pose: dict[int, float]) -> list[tuple[int, int]]:
     return [(int(servo_id), int(round(pos))) for servo_id, pos in pose.items()]
 
 
-def cmd_walk(ser: serial.Serial, speed_mm_s: float, stride_mm: float | None = None):
-    """以三角步态行走，Ctrl+C 停止并回到自然站立姿态。
+def cmd_gait(ser: serial.Serial, speed_mm_s: float,
+             stride_mm: float | None, *, lateral: bool):
+    """以三角步态前后行走或左右平移，Ctrl+C 停止并回到自然站立姿态。
 
-    speed_mm_s 为正值时前进、负值时后退，范围钳制到 ±WALK_SPEED_LIMIT。
-    stride_mm 为足端在每个支撑/摆动相内扫过的距离（脚前后各摆 stride/2），
-    默认取 WALK_STRIDE_DEFAULT，不做钳制；超出腿部工作空间时由 IK 抛
-    UnreachableFootError，不静默钳位。
-    周期 T = 2*stride/speed：支撑相内身体前进 stride、足端相对身体后退
-    stride，保证足端在地面不打滑。启动时先发送自然站立姿态，随后步幅在
-    约 1.5 个周期内从 0 平滑爬升。
+    lateral=False 时走前后方向：speed_mm_s 正值前进、负值后退；
+    lateral=True 时横向移动：speed_mm_s 正值左移、负值右移。
+    speed 范围钳制到 ±WALK_SPEED_LIMIT；stride_mm 是足端在每个支撑/摆动相
+    内扫过的距离，默认取对应方向的 WALK_STRIDE_DEFAULT / STRAFE_STRIDE_DEFAULT，
+    不做钳制，超出腿部工作空间时由 IK 抛 UnreachableFootError。
+    周期 T = 2*stride/speed，支撑相内足端相对身体反向移动 stride，保证足端
+    在地面不打滑。启动时先发送自然站立姿态，随后步幅在约 1.5 个周期内
+    从 0 平滑爬升。
     """
     speed = float(speed_mm_s)
     if not math.isfinite(speed):
@@ -304,19 +313,19 @@ def cmd_walk(ser: serial.Serial, speed_mm_s: float, stride_mm: float | None = No
 
     gait = GAIT
     if stride_mm is None:
-        gait.stride = WALK_STRIDE_DEFAULT
+        stride = STRAFE_STRIDE_DEFAULT if lateral else WALK_STRIDE_DEFAULT
     else:
         try:
-            gait.stride = float(stride_mm)
+            stride = float(stride_mm)
         except (TypeError, ValueError):
             print(f"无效的步幅: {stride_mm!r}")
             return
-        if not math.isfinite(gait.stride):
+        if not math.isfinite(stride):
             print(f"无效的步幅: {stride_mm!r}（必须为有限数值）")
             return
     stand_pose = gait.stand_pose()
 
-    if abs(speed) < 1e-9 or gait.stride <= 0:
+    if abs(speed) < 1e-9 or stride <= 0:
         send_move(ser, quantize_pose(stand_pose), WALK_STAND_MOVE_TIME_MS)
         print("速度为 0 或步幅非正，已发送自然站立姿态。")
         try:
@@ -325,13 +334,17 @@ def cmd_walk(ser: serial.Serial, speed_mm_s: float, stride_mm: float | None = No
             print()
         return
 
-    direction = "前进" if speed > 0 else "后退"
+    if lateral:
+        direction = "左移" if speed > 0 else "右移"
+    else:
+        direction = "前进" if speed > 0 else "后退"
     # 支撑/摆动相各扫过 stride，占半个周期；要让足端在地面不打滑，
     # 周期必须是 2*stride/speed（而不是 stride/speed）。
-    cycle_s = 2.0 * abs(gait.stride) / abs(speed)
+    cycle_s = 2.0 * abs(stride) / abs(speed)
     ramp_s = 1.5 * cycle_s
-    print(f"开始步态：速度 {speed:+.1f} mm/s（{direction}），"
-          f"步幅 {gait.stride:g} mm，周期 {cycle_s:.3f} s。"
+    motion = "横向步态" if lateral else "步态"
+    print(f"开始{motion}：速度 {speed:+.1f} mm/s（{direction}），"
+          f"步幅 {stride:g} mm，周期 {cycle_s:.3f} s。"
           f"按 Ctrl+C 停止。")
 
     # 先站到自然姿态，再进入步态循环
@@ -352,9 +365,11 @@ def cmd_walk(ser: serial.Serial, speed_mm_s: float, stride_mm: float | None = No
             # 约 1.5 个周期内把步幅从 0 平滑爬升到目标值
             ramp_progress = min(1.0, elapsed / ramp_s)
             smooth = ramp_progress * ramp_progress * (3 - 2 * ramp_progress)
-            stride_now = math.copysign(gait.stride * smooth, speed)
-
-            pose = gait.pose_at(phase, stride_now)
+            stride_now = math.copysign(stride * smooth, speed)
+            if lateral:
+                pose = gait.pose_at(phase, 0.0, stride_now)
+            else:
+                pose = gait.pose_at(phase, stride_now)
             send_move(ser, quantize_pose(pose), WALK_MOVE_TIME_MS)
 
             delay = frame_start + WALK_FRAME_PERIOD - time.monotonic()
@@ -371,6 +386,104 @@ def cmd_walk(ser: serial.Serial, speed_mm_s: float, stride_mm: float | None = No
             print()
 
 
+def cmd_walk(ser: serial.Serial, speed_mm_s: float,
+             stride_mm: float | None = None):
+    """以三角步态前后行走；参数含义见 cmd_gait。"""
+    cmd_gait(ser, speed_mm_s, stride_mm, lateral=False)
+
+
+def cmd_strafe(ser: serial.Serial, speed_mm_s: float,
+               stride_mm: float | None = None):
+    """以三角步态左右平移（正数左移、负数右移）；参数含义见 cmd_gait。"""
+    cmd_gait(ser, speed_mm_s, stride_mm, lateral=True)
+
+
+def cmd_turn(ser: serial.Serial, speed_deg_s: float,
+             step_deg: float | None = None):
+    """以三角步态原地旋转，Ctrl+C 停止并回到自然站立姿态。
+
+    speed_deg_s 为正值时俯视逆时针（左转）、负值时顺时针（右转），
+    范围钳制到 ±TURN_SPEED_LIMIT；step_deg 是每个完整步态周期身体旋转的
+    角度，默认取 TURN_STEP_DEFAULT，不做钳制，超出腿部工作空间时由 IK 抛
+    UnreachableFootError。
+    周期 T = 2*step/speed：支撑相内身体旋转 step、足端相对身体反向旋转
+    step，保证足端在地面不打滑。启动时先发送自然站立姿态，随后转角在
+    约 1.5 个周期内从 0 平滑爬升。
+    """
+    speed = float(speed_deg_s)
+    if not math.isfinite(speed):
+        print(f"无效的旋转速度: {speed_deg_s!r}（必须为有限数值）")
+        return
+    speed = max(-TURN_SPEED_LIMIT, min(TURN_SPEED_LIMIT, speed))
+
+    if step_deg is None:
+        step = TURN_STEP_DEFAULT
+    else:
+        try:
+            step = float(step_deg)
+        except (TypeError, ValueError):
+            print(f"无效的单周期转角: {step_deg!r}")
+            return
+        if not math.isfinite(step):
+            print(f"无效的单周期转角: {step_deg!r}（必须为有限数值）")
+            return
+    stand_pose = GAIT.stand_pose()
+
+    if abs(speed) < 1e-9 or step <= 0:
+        send_move(ser, quantize_pose(stand_pose), WALK_STAND_MOVE_TIME_MS)
+        print("旋转速度为 0 或单周期转角非正，已发送自然站立姿态。")
+        try:
+            time.sleep(1.0)
+        except KeyboardInterrupt:
+            print()
+        return
+
+    direction = "左转（俯视逆时针）" if speed > 0 else "右转（俯视顺时针）"
+    # 支撑/摆动相各扫过 step，占半个周期；要让足端在地面不打滑，
+    # 周期必须是 2*step/speed（而不是 step/speed）。
+    cycle_s = 2.0 * abs(step) / abs(speed)
+    ramp_s = 1.5 * cycle_s
+    print(f"开始原地旋转：角速度 {speed:+.1f} deg/s（{direction}），"
+          f"单周期转角 {step:g}°，周期 {cycle_s:.3f} s。"
+          f"按 Ctrl+C 停止。")
+
+    # 先站到自然姿态，再进入旋转步态循环
+    send_move(ser, quantize_pose(stand_pose), WALK_STAND_MOVE_TIME_MS)
+    try:
+        time.sleep(1.0)
+    except KeyboardInterrupt:
+        print("旋转启动被中断，保持自然站立姿态。")
+        return
+
+    start = time.monotonic()
+    try:
+        while True:
+            frame_start = time.monotonic()
+            elapsed = frame_start - start
+            phase = (elapsed / cycle_s) % 1.0
+
+            # 约 1.5 个周期内把单周期转角从 0 平滑爬升到目标值
+            ramp_progress = min(1.0, elapsed / ramp_s)
+            smooth = ramp_progress * ramp_progress * (3 - 2 * ramp_progress)
+            step_now = math.copysign(step * smooth, speed)
+
+            pose = GAIT.turn_pose_at(phase, math.radians(step_now))
+            send_move(ser, quantize_pose(pose), WALK_MOVE_TIME_MS)
+
+            delay = frame_start + WALK_FRAME_PERIOD - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+    except KeyboardInterrupt:
+        print()
+    finally:
+        send_move(ser, quantize_pose(stand_pose), WALK_STAND_MOVE_TIME_MS)
+        print("旋转已停止，已回到自然站立姿态。")
+        try:
+            time.sleep(1.0)
+        except KeyboardInterrupt:
+            print()
+
+
 def print_help():
     print(
         "可用命令:\n"
@@ -380,6 +493,12 @@ def print_help():
         "  flatten  展平（内置姿态）\n"
         "  walk     以三角步态行走（可选速度 mm/s 和步幅 mm，"
         f"默认 {WALK_SPEED_DEFAULT:g} {WALK_STRIDE_DEFAULT:g}）\n"
+        "  strafe   以三角步态左右平移（可选速度 mm/s 和步幅 mm，"
+        f"默认 {STRAFE_SPEED_DEFAULT:g} {STRAFE_STRIDE_DEFAULT:g}，"
+        "正数左移、负数右移）\n"
+        "  turn     原地旋转（可选角速度 deg/s 和单周期转角 deg，"
+        f"默认 {TURN_SPEED_DEFAULT:g} {TURN_STEP_DEFAULT:g}，"
+        "正数左转、负数右转）\n"
         "  relax    卸载所有舵机（失能，可手动转动）\n"
         "  help     显示本帮助\n"
         "  quit     退出程序（退出前自动失能全部舵机）"
@@ -439,6 +558,34 @@ def run_repl(ser: serial.Serial, move_time_ms: int):
                         print(error)
                         continue
                 cmd_walk(ser, speed, stride)
+            elif command in ("strafe", "slide", "lr"):
+                speed = STRAFE_SPEED_DEFAULT
+                stride = None
+                if len(tokens) > 1:
+                    speed, error = _parse_float_arg(tokens, 1, "速度")
+                    if error:
+                        print(error)
+                        continue
+                if len(tokens) > 2:
+                    stride, error = _parse_float_arg(tokens, 2, "步幅")
+                    if error:
+                        print(error)
+                        continue
+                cmd_strafe(ser, speed, stride)
+            elif command in ("turn", "rotate", "rot"):
+                speed = TURN_SPEED_DEFAULT
+                step = None
+                if len(tokens) > 1:
+                    speed, error = _parse_float_arg(tokens, 1, "旋转速度")
+                    if error:
+                        print(error)
+                        continue
+                if len(tokens) > 2:
+                    step, error = _parse_float_arg(tokens, 2, "单周期转角")
+                    if error:
+                        print(error)
+                        continue
+                cmd_turn(ser, speed, step)
             elif command == "relax" and len(tokens) == 1:
                 cmd_relax(ser)
             elif command in ("help", "h", "?") and len(tokens) == 1:
