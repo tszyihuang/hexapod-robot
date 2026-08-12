@@ -30,9 +30,9 @@ from pathlib import Path
 
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().with_name("physical_config.json")
 
-# 名义量程是 0-1023（10 位），配置里小腿写 0-1024，这里统一收进 1023，
-# 避免出现无法用 10 位序列化表示的位置值。
-SERVO_POS_MAX = 1023
+# 舵机实际有效量程 0-1000（对应 0-240°），控制板标称 10 位量程 0-1023；
+# 这里统一按有效量程收进 1000，避免生成硬件无法正确执行或可能被钳制的位置。
+SERVO_POS_MAX = 1000
 
 # 数值比较容差
 _EPS = 1e-9
@@ -159,7 +159,15 @@ class HexapodIK:
         """(theta, phi, kappa) 弧度 -> 三个舵机位置（不做限位检查）。"""
         scale = self.scale
         anchor = self.hip_anchors[int(leg_id)]
-        hip = 512 + (math.degrees(theta) - anchor) / scale
+        # 把 theta 归一化到 [anchor-180, anchor+180) 区间：solve_leg 里的
+        # atan2 会把“越过正后方”的角度折回 ±180° 另一侧，直接代入会误判
+        # 后腿的一小段物理可达扇区为不可达。
+        theta_deg = math.degrees(theta)
+        while theta_deg - anchor > 180.0:
+            theta_deg -= 360.0
+        while theta_deg - anchor < -180.0:
+            theta_deg += 360.0
+        hip = 512 + (theta_deg - anchor) / scale
         if self.side_of(leg_id) == "left":
             femur = 512 - math.degrees(phi) / scale
             tibia = 512 + (45 - math.degrees(kappa)) / scale
@@ -215,6 +223,15 @@ class HexapodIK:
 
         theta = math.atan2(dy, dx)
         r = math.hypot(dx, dy) - self.coxa
+
+        # 足端水平投影落在髋关节的 coxa 半径内时，真实腿无法折回，
+        # 但平面两连杆模型仍会给出“折叠”假解，必须显式拒绝。
+        if r <= _EPS:
+            raise UnreachableFootError(
+                f"腿 {leg_id} 足端 {foot_xyz} 距离髋关节过近"
+                f"（水平距离 {math.hypot(dx, dy):.3f}mm ≤ coxa {self.coxa:g}mm），"
+                "超出工作空间"
+            )
 
         # 两连杆（大腿 + 小腿）在工作平面 (r, dz) 内的余弦定理
         cos_k = (

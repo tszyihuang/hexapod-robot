@@ -19,6 +19,8 @@ theta0 按腿分别取值：以各腿髋舵机的安装朝向（位置 512 时�
   - 摆动相 0.5 <= u < 1：足端从 natural - stride/2 前进到
     natural + stride/2，z = -H + step_height*sin(pi*v) 抬起。
   - stride 带符号：正数前进、负数后退；step_height 始终为抬起的幅值。
+    时间映射由调用方决定：周期 T = 2*stride/speed。这样支撑相内身体前进
+    stride、足端相对身体后退 stride，足端在地面不打滑。
 
 本模块只负责生成足端轨迹和舵机姿态，不负责串口与步态时间调度；
 启动时的自然站立姿态和约 1.5 个周期的步幅平滑爬升由 servo_driver 的
@@ -45,7 +47,7 @@ class TripodGait:
         body_height: float = 70.0,
         forward_bias_deg: float = 5.0,
         reach: float = 90.0,
-        stride: float = 30.0,
+        stride: float = 60.0,
         step_height: float = 30.0,
     ):
         self.ik = ik if ik is not None else HexapodIK()

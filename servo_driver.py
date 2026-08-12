@@ -23,9 +23,11 @@
 """
 
 import argparse
+import json
 import math
 import sys
 import time
+from pathlib import Path
 
 import serial
 
@@ -41,32 +43,30 @@ CMD_SERVO_MOVE = 0x03
 CMD_MULT_SERVO_UNLOAD = 0x14
 
 SERVO_IDS = list(range(1, 19))
+CONFIG_PATH = Path(__file__).resolve().with_name("physical_config.json")
 
 # ---------------------------------------------------------------- 步态参数
 
 WALK_SPEED_DEFAULT = 30.0      # mm/s，正数前进、负数后退
 WALK_SPEED_LIMIT = 90.0        # mm/s
-WALK_STRIDE_DEFAULT = 60.0     # mm，每周期总跨步量（脚前后各摆 stride/2）
+WALK_STRIDE_DEFAULT = 60.0     # mm，足端在每个支撑/摆动相内扫过的距离（前后各摆 stride/2）
 WALK_FRAME_PERIOD = 0.10       # s，帧周期
 WALK_MOVE_TIME_MS = 90         # 每帧舵机移动时间，适配 9600 串口带宽
 WALK_STAND_MOVE_TIME_MS = 800  # 启动/停止时回到自然站立的移动时间
 
 # ---------------------------------------------------------------- 内置数据
 
-STANDING_POSE = {
-    # leg1 = 左后
-    1: 500, 2: 300, 3: 200,
-    # leg2 = 左中
-    4: 500, 5: 300, 6: 200,
-    # leg3 = 左前
-    7: 500, 8: 300, 9: 200,
-    # leg4 = 右后
-    10: 500, 11: 700, 12: 800,
-    # leg5 = 右中
-    13: 500, 14: 700, 15: 800,
-    # leg6 = 右前
-    16: 500, 17: 700, 18: 800,
-}
+def natural_stand_pose() -> dict[int, int]:
+    """自然站立姿态：由 IK 按 physical_config.json 生成。
+
+    与 cmd_walk 使用同一套中立足端（含 5° 前偏），保证 stand -> walk
+    -> 停止之间姿态连续、无跳变。
+    """
+    return {
+        int(sid): int(round(pos))
+        for sid, pos in TripodGait(ik=HexapodIK()).stand_pose().items()
+    }
+
 
 FLATTEN_POSE = {
     # leg1 = 左后
@@ -82,166 +82,6 @@ FLATTEN_POSE = {
     # leg6 = 右前
     16: 500, 17: 500, 18: 500,
 }
-
-PHYSICAL_CONFIG = {
-    "name": "hexapod_physical_config",
-    "description": "Spiderbot 六足机器人物理数据配置：舵机-腿映射、默认位置、腿部几何尺寸。",
-    "units": {
-        "length": "mm",
-        "servo_position": "Lobot 0-1023",
-        "angle": "deg",
-    },
-    "total_servos": 18,
-    "servos_per_leg": 3,
-    "total_legs": 6,
-    "servo_model": "Hiwonder LX-15D",
-    "default_flatten_position": 500,
-    "servo_position_range": [0, 1000],
-    "servo_position_nominal_range": [0, 1023],
-    "servo_angle_range_deg": [0, 240],
-    "angle_scale_deg_per_unit": 0.24,
-    "coordinate_system": {
-        "origin": "身体中心",
-        "x": "向前为正",
-        "y": "向左为正",
-        "z": "向上为正",
-    },
-    "joint_role_ids": {
-        "hip": [1, 4, 7, 10, 13, 16],
-        "femur": [2, 5, 8, 11, 14, 17],
-        "tibia": [3, 6, 9, 12, 15, 18],
-    },
-    "hip_servo_rotation": {
-        "servo_ids": [1, 4, 7, 10, 13, 16],
-        "view_from": "上方（俯视）",
-        "direction": "顺时针旋转时，角度位置值减小",
-    },
-    "femur_servo_rotation": {
-        "left_femur_servo_ids": [2, 5, 8],
-        "left_direction": "往上抬时，角度位置值减小",
-        "right_femur_servo_ids": [11, 14, 17],
-        "right_direction": "往上抬时，角度位置值增大",
-    },
-    "tibia_servo_rotation": {
-        "left_tibia_servo_ids": [3, 6, 9],
-        "left_direction": "往上抬时，角度位置值增大",
-        "right_tibia_servo_ids": [12, 15, 18],
-        "right_direction": "往上抬时，角度位置值减小",
-    },
-    "leg_side_by_id": {
-        "left": [1, 2, 3],
-        "right": [4, 5, 6],
-    },
-    "angle_conventions": {
-        "hip": {
-            "symbol": "theta",
-            "zero_reference": "0° = 腿指向身体正前方(+x)；俯视向左(逆时针)为正",
-            "anchor_at_512": {
-                "left_legs": "指向左前方 45°（theta = +45°）",
-                "right_legs": "指向右前方 45°（theta = -45°）",
-            },
-            "direction_rule": "俯视顺时针转动 → 位置值减小；左右六条髋相同",
-        },
-        "femur": {
-            "symbol": "phi",
-            "zero_reference": "0° = 大腿水平（与身体平面平行）；向上抬为正",
-            "anchor_at_512": "大腿水平，phi = 0°",
-            "direction_rule": {
-                "left_legs": "往上抬 → 位置值减小",
-                "right_legs": "往上抬 → 位置值增大",
-            },
-        },
-        "tibia": {
-            "symbol": "kappa",
-            "zero_reference": "0° = 小腿与大腿同向伸直；向下偏为正",
-            "anchor_at_512": "小腿相对大腿轴线向下偏 45°（kappa = +45°）",
-            "direction_rule": {
-                "left_legs": "往上抬 → 位置值增大",
-                "right_legs": "往上抬 → 位置值减小",
-            },
-        },
-    },
-    "position_to_angle_formula": {
-        "common": "deg = (pos - 512) * 0.24",
-        "left_legs": {
-            "hip_deg": "45 + deg",
-            "femur_deg": "-deg",
-            "tibia_deg": "45 - deg",
-        },
-        "right_legs": {
-            "hip_deg": "-45 + deg",
-            "femur_deg": "+deg",
-            "tibia_deg": "45 + deg",
-        },
-    },
-    "joint_limits": {
-        "hip": {
-            "angle_deg": [-45, 45],
-            "position_range": {
-                "left_legs": [137, 512],
-                "right_legs": [512, 887],
-            },
-        },
-        "femur": {
-            "angle_deg": [-90, 90],
-            "position_range": {
-                "left_legs": [137, 887],
-                "right_legs": [137, 887],
-            },
-        },
-        "tibia": {
-            "note": "无额外物理限位，使用舵机全量程",
-            "position_range": {
-                "left_legs": [0, 1024],
-                "right_legs": [0, 1024],
-            },
-        },
-    },
-    "legs": [
-        {"id": 1, "servos": {"hip": 1, "femur": 2, "tibia": 3}},
-        {"id": 2, "servos": {"hip": 4, "femur": 5, "tibia": 6}},
-        {"id": 3, "servos": {"hip": 7, "femur": 8, "tibia": 9}},
-        {"id": 4, "servos": {"hip": 10, "femur": 11, "tibia": 12}},
-        {"id": 5, "servos": {"hip": 13, "femur": 14, "tibia": 15}},
-        {"id": 6, "servos": {"hip": 16, "femur": 17, "tibia": 18}},
-    ],
-    "leg_geometry_mm": {
-        "coxa_length_mm": 43,
-        "femur_length_mm": 75,
-        "tibia_length_mm": 140,
-    },
-    "mounting_positions_mm": {
-        "left_front": {"x": 118, "y": 58},
-        "left_middle": {"x": 0, "y": 90},
-        "left_rear": {"x": -118, "y": 58},
-        "right_front": {"x": 118, "y": -58},
-        "right_middle": {"x": 0, "y": -90},
-        "right_rear": {"x": -118, "y": -58},
-    },
-    "leg_position_mapping": {
-        "1": "left_rear",
-        "2": "left_middle",
-        "3": "left_front",
-        "4": "right_rear",
-        "5": "right_middle",
-        "6": "right_front",
-    },
-    "notes": [
-        "每 3 个舵机 ID 为一条腿：1-3 为腿 1，4-6 为腿 2，以此类推到 16-18 为腿 6。",
-        "每条腿内第一个舵机为髋关节(hip)，第二个为大腿(femur)，第三个为小腿(tibia)。",
-        "500 为所有舵机的默认展平位置。",
-        "LX-15D 舵机 0-1000 对应 0-240°，每单位位置值 0.24°；控制板标称范围 0-1023，实际有效范围 0-1000。",
-        "coxa_length_mm = 43 为用户实测的髋关节水平偏置段长度。",
-        "左前/左中/左后安装位置为用户实测；右侧三腿暂按左右对称镜像填入，如实物不同请更正。",
-        "腿编号与物理位置对应关系已确认：腿1=左后、腿2=左中、腿3=左前、腿4=右后、腿5=右中、腿6=右前。",
-        "根部(髋)舵机 1/4/7/10/13/16：从上往下看时，顺时针转动对应的角度位置值减小。",
-        "大腿(femur)舵机：左边 2/5/8 往上抬时角度位置值减小，右边 11/14/17 往上抬时角度位置值增大。",
-        "小腿(tibia)舵机：左边 3/6/9 往上抬时角度位置值增大，右边 12/15/18 往上抬时角度位置值减小。",
-        "角度换算已确认：deg = (pos - 512) * 0.24；髋 512 → 左腿 +45° / 右腿 -45°，大腿 512 → 0°(水平)，小腿 512 → +45°(相对大腿下偏)。详见 angle_conventions 与 position_to_angle_formula。",
-        "物理限位：髋 ±45°（左腿位置 137-512、右腿 512-887），大腿 ±90°（位置 137-887），小腿无额外限位（0-1024；舵机规格有效范围 0-1000，超出可能被钳制）。详见 joint_limits。",
-    ],
-}
-
 
 # ---------------------------------------------------------------- 串口协议
 
@@ -384,18 +224,22 @@ def load_pose(data: dict) -> list[tuple[int, int]]:
     for key, pos in data.items():
         servo_id = int(key)
         pos = int(pos)
-        if not 1 <= servo_id <= 32:
+        if not 1 <= servo_id <= len(SERVO_IDS):
             raise ValueError(f"舵机 ID 超出范围: {servo_id}")
-        if not 0 <= pos <= 1023:
+        if not 0 <= pos <= 1000:
             raise ValueError(f"舵机 {servo_id} 的位置超出范围: {pos}")
         servos.append((servo_id, pos))
     return sorted(servos)
 
 
 def load_leg_labels() -> dict[int, str]:
-    """从内置物理配置读取腿名映射，读不到时退回 legN。"""
+    """从 physical_config.json 读取腿名映射，读不到时退回 legN。"""
     labels = {sid: f"leg{(sid - 1) // 3 + 1}" for sid in SERVO_IDS}
-    mapping = PHYSICAL_CONFIG.get("leg_position_mapping", {})
+    try:
+        with CONFIG_PATH.open("r", encoding="utf-8") as fh:
+            mapping = json.load(fh).get("leg_position_mapping", {})
+    except (OSError, ValueError):
+        mapping = {}
     roles = ("hip", "femur", "tibia")
     for leg, name in mapping.items():
         try:
@@ -443,7 +287,11 @@ def cmd_pose(ser: serial.Serial, name: str, pose: dict, time_ms: int):
     send_move(ser, servos, time_ms)
     print(f"已发送移动指令（{len(servos)} 个舵机，{time_ms}ms 内到位）")
     wait = max(0.2, time_ms / 1000 + 0.5)
-    time.sleep(wait)
+    try:
+        time.sleep(wait)
+    except KeyboardInterrupt:
+        print("等待被中断；移动指令已发送，舵机仍会完成到位。")
+        return
     print("移动完成，舵机保持通电维持姿态。")
 
 
@@ -460,25 +308,45 @@ def quantize_pose(pose: dict[int, float]) -> list[tuple[int, int]]:
 def cmd_walk(ser: serial.Serial, speed_mm_s: float, stride_mm: float | None = None):
     """以三角步态行走，Ctrl+C 停止并回到自然站立姿态。
 
-    speed_mm_s 为正值时前进、负值时后退，范围钳制到 [-60, 60]。
-    stride_mm 为每周期总跨步量，默认取 WALK_STRIDE_DEFAULT，不做钳制；
-    超出腿部工作空间时由 IK 抛 UnreachableFootError，不静默钳位。
-    启动时先发送自然站立姿态，随后步幅在约 1.5 个周期内从 0 平滑爬升。
+    speed_mm_s 为正值时前进、负值时后退，范围钳制到 ±WALK_SPEED_LIMIT。
+    stride_mm 为足端在每个支撑/摆动相内扫过的距离（脚前后各摆 stride/2），
+    默认取 WALK_STRIDE_DEFAULT，不做钳制；超出腿部工作空间时由 IK 抛
+    UnreachableFootError，不静默钳位。
+    周期 T = 2*stride/speed：支撑相内身体前进 stride、足端相对身体后退
+    stride，保证足端在地面不打滑。启动时先发送自然站立姿态，随后步幅在
+    约 1.5 个周期内从 0 平滑爬升。
     """
-    speed = max(-WALK_SPEED_LIMIT, min(WALK_SPEED_LIMIT, float(speed_mm_s)))
+    speed = float(speed_mm_s)
+    if not math.isfinite(speed):
+        print(f"无效的速度: {speed_mm_s!r}（必须为有限数值）")
+        return
+    speed = max(-WALK_SPEED_LIMIT, min(WALK_SPEED_LIMIT, speed))
+
     gait = TripodGait(ik=HexapodIK(), stride=WALK_STRIDE_DEFAULT)
     if stride_mm is not None:
-        gait.stride = float(stride_mm)
+        try:
+            gait.stride = float(stride_mm)
+        except (TypeError, ValueError):
+            print(f"无效的步幅: {stride_mm!r}")
+            return
+        if not math.isfinite(gait.stride):
+            print(f"无效的步幅: {stride_mm!r}（必须为有限数值）")
+            return
     stand_pose = gait.stand_pose()
 
     if abs(speed) < 1e-9 or gait.stride <= 0:
         send_move(ser, quantize_pose(stand_pose), WALK_STAND_MOVE_TIME_MS)
-        print("速度为 0 或步幅为 0，已发送自然站立姿态。")
-        time.sleep(1.0)
+        print("速度为 0 或步幅非正，已发送自然站立姿态。")
+        try:
+            time.sleep(1.0)
+        except KeyboardInterrupt:
+            print()
         return
 
     direction = "前进" if speed > 0 else "后退"
-    cycle_s = abs(gait.stride) / abs(speed)
+    # 支撑/摆动相各扫过 stride，占半个周期；要让足端在地面不打滑，
+    # 周期必须是 2*stride/speed（而不是 stride/speed）。
+    cycle_s = 2.0 * abs(gait.stride) / abs(speed)
     ramp_s = 1.5 * cycle_s
     print(f"开始步态：速度 {speed:+.1f} mm/s（{direction}），"
           f"步幅 {gait.stride:g} mm，周期 {cycle_s:.3f} s。"
@@ -486,7 +354,11 @@ def cmd_walk(ser: serial.Serial, speed_mm_s: float, stride_mm: float | None = No
 
     # 先站到自然姿态，再进入步态循环
     send_move(ser, quantize_pose(stand_pose), WALK_STAND_MOVE_TIME_MS)
-    time.sleep(1.0)
+    try:
+        time.sleep(1.0)
+    except KeyboardInterrupt:
+        print("步态启动被中断，保持自然站立姿态。")
+        return
 
     start = time.monotonic()
     try:
@@ -552,14 +424,14 @@ def run_repl(ser: serial.Serial, move_time_ms: int):
                     except ValueError:
                         print(f"无效的刷新间隔: {parts[1]!r}")
                         continue
-                    if interval < 0:
-                        print("刷新间隔不能为负数")
+                    if not math.isfinite(interval) or interval < 0:
+                        print(f"无效的刷新间隔: {parts[1]!r}（必须为有限的非负数）")
                         continue
                 else:
                     interval = 0.1
                 monitor_servos(ser, SERVO_IDS, interval)
             elif line in ("stand", "s"):
-                cmd_pose(ser, "站立", STANDING_POSE, move_time_ms)
+                cmd_pose(ser, "站立", natural_stand_pose(), move_time_ms)
             elif line in ("flatten", "f"):
                 cmd_pose(ser, "展平", FLATTEN_POSE, move_time_ms)
             elif line in ("walk", "w") or line.startswith(("walk ", "w ")):
@@ -601,6 +473,8 @@ def main():
 
     if args.time <= 0:
         parser.error("--time 必须大于 0")
+    if args.baud <= 0:
+        parser.error("--baud 必须大于 0")
 
     try:
         ser = serial.Serial(port=args.port, baudrate=args.baud, bytesize=8,
