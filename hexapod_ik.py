@@ -10,7 +10,9 @@
 
 每条腿为平面三连杆机构（俯视）：
   - 髋(hip)：绕竖直轴旋转，方向角 theta，0° = 指向身体正前方(+x)，
-    俯视向左（逆时针）为正。
+    俯视向左（逆时针）为正。各腿的髋舵机安装朝向不同：位置 512 时，
+    前腿指向 ±45°、中腿指向 ±90°、后腿指向 ±135°（见配置的
+    hip_anchor_direction_deg），旋转方向规则六条腿相同。
   - coxa：髋关节之后、沿 theta 方向的水平偏置段（43 mm）。
   - 大腿(femur)：在含 theta 方向的竖直平面内，相对水平面上抬为正（phi）。
   - 小腿(tibia)：相对大腿轴线向下偏为正（kappa），0° = 与大腿同向伸直。
@@ -75,6 +77,14 @@ class HexapodIK:
             for leg_id in leg_ids:
                 self.sides[int(leg_id)] = "left" if side == "left" else "right"
 
+        # 腿 id -> 髋舵机在 512 位置时腿的指向（身体坐标，度）
+        # 每条腿的髋舵机安装朝向不同，缺省时退回旧的左右 ±45° 约定
+        anchors = self.config.get("hip_anchor_direction_deg", {})
+        self.hip_anchors: dict[int, float] = {}
+        for leg_id in self.legs:
+            default = 45.0 if self.sides[leg_id] == "left" else -45.0
+            self.hip_anchors[leg_id] = float(anchors.get(str(leg_id), default))
+
         # 腿 id -> 髋关节安装点 (x, y)，髋平面 z = 0
         self.mounts: dict[int, tuple[float, float]] = {}
         mapping = self.config["leg_position_mapping"]
@@ -133,12 +143,12 @@ class HexapodIK:
         """
         hip, femur, tibia = self._resolve_leg_positions(leg_id, positions)
         scale = self.scale
+        anchor = self.hip_anchors[int(leg_id)]
+        theta = math.radians(anchor + (hip - 512) * scale)
         if self.side_of(leg_id) == "left":
-            theta = math.radians(45 + (hip - 512) * scale)
             phi = math.radians(-(femur - 512) * scale)
             kappa = math.radians(45 - (tibia - 512) * scale)
         else:
-            theta = math.radians(-45 + (hip - 512) * scale)
             phi = math.radians((femur - 512) * scale)
             kappa = math.radians(45 + (tibia - 512) * scale)
         return theta, phi, kappa
@@ -148,12 +158,12 @@ class HexapodIK:
     ) -> dict[int, float]:
         """(theta, phi, kappa) 弧度 -> 三个舵机位置（不做限位检查）。"""
         scale = self.scale
+        anchor = self.hip_anchors[int(leg_id)]
+        hip = 512 + (math.degrees(theta) - anchor) / scale
         if self.side_of(leg_id) == "left":
-            hip = 512 + (math.degrees(theta) - 45) / scale
             femur = 512 - math.degrees(phi) / scale
             tibia = 512 + (45 - math.degrees(kappa)) / scale
         else:
-            hip = 512 + (math.degrees(theta) + 45) / scale
             femur = 512 + math.degrees(phi) / scale
             tibia = 512 + (math.degrees(kappa) - 45) / scale
         servos = self.legs[int(leg_id)]

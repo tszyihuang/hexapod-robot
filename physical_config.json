@@ -1,6 +1,6 @@
 {
   "name": "hexapod_physical_config",
-  "description": "Spiderbot 六足机器人物理数据配置：舵机-腿映射、默认位置、腿部几何尺寸。",
+  "description": "Spiderbot 六足机器人物理数据配置：舵机-腿映射、各腿髋关节安装朝向、关节限位、默认位置与腿部几何尺寸。",
   "units": {
     "length": "mm",
     "servo_position": "Lobot 0-1023",
@@ -47,14 +47,20 @@
     "left": [1, 2, 3],
     "right": [4, 5, 6]
   },
+  "hip_anchor_direction_deg": {
+    "1": 135,
+    "2": 90,
+    "3": 45,
+    "4": -135,
+    "5": -90,
+    "6": -45
+  },
   "angle_conventions": {
     "hip": {
       "symbol": "theta",
       "zero_reference": "0° = 腿指向身体正前方(+x)；俯视向左(逆时针)为正",
-      "anchor_at_512": {
-        "left_legs": "指向左前方 45°（theta = +45°）",
-        "right_legs": "指向右前方 45°（theta = -45°）"
-      },
+      "anchor_at_512": "各腿安装朝向不同：前腿 ±45°、中腿 ±90°、后腿 ±135°，详见 hip_anchor_direction_deg",
+      "natural_direction": "自然站立方向 = 安装朝向再向身体前方偏 5°（前 40°、中 85°、后 130°，右腿取负）",
       "direction_rule": "俯视顺时针转动 → 位置值减小；左右六条髋相同"
     },
     "femur": {
@@ -79,36 +85,36 @@
   "position_to_angle_formula": {
     "common": "deg = (pos - 512) * 0.24",
     "left_legs": {
-      "hip_deg": "45 + deg",
+      "hip_deg": "hip_anchor_direction_deg[leg] + deg",
       "femur_deg": "-deg",
       "tibia_deg": "45 - deg"
     },
     "right_legs": {
-      "hip_deg": "-45 + deg",
+      "hip_deg": "hip_anchor_direction_deg[leg] + deg",
       "femur_deg": "+deg",
       "tibia_deg": "45 + deg"
     }
   },
   "joint_limits": {
     "hip": {
-      "angle_deg": [-45, 45],
+      "note": "实机验证可用范围：位置 300–700，即相对各腿安装朝向约 -50.9° ~ +45.1°",
       "position_range": {
         "left_legs": [300, 700],
         "right_legs": [300, 700]
       }
     },
     "femur": {
-      "angle_deg": [-90, 90],
+      "note": "实机验证可用范围：位置 100–900，大腿相对水平面约 ±90°（左腿 phi=-deg、右腿 phi=+deg，两端余量略有不对称）",
       "position_range": {
         "left_legs": [100, 900],
         "right_legs": [100, 900]
       }
     },
     "tibia": {
-      "note": "无额外物理限位，使用舵机全量程",
+      "note": "无额外物理限位，使用舵机有效量程 0–1023（10 位协议上限）",
       "position_range": {
-        "left_legs": [0, 1024],
-        "right_legs": [0, 1024]
+        "left_legs": [0, 1023],
+        "right_legs": [0, 1023]
       }
     }
   },
@@ -147,12 +153,13 @@
     "500 为所有舵机的默认展平位置，对应 flatten_pose.json 中各舵机 500 的姿态。",
     "LX-15D 舵机 0-1000 对应 0-240°，每单位位置值 0.24°；控制板标称范围 0-1023，实际有效范围 0-1000。",
     "coxa_length_mm = 43 为用户实测的髋关节水平偏置段长度。",
-    "左前/左中/左后安装位置为用户实测；右侧三腿暂按左右对称镜像填入(y 取负)，如实物不同请更正。",
+    "左右安装位置已确认：左侧为用户实测，右侧为左右对称镜像（y 取负），实机行走正常。",
     "腿编号与物理位置对应关系已确认：腿1=左后、腿2=左中、腿3=左前、腿4=右后、腿5=右中、腿6=右前。",
     "根部(髋)舵机 1/4/7/10/13/16：从上往下看时，顺时针转动对应的角度位置值减小。",
     "大腿(femur)舵机：左边 2/5/8 往上抬时角度位置值减小，右边 11/14/17 往上抬时角度位置值增大。",
     "小腿(tibia)舵机：左边 3/6/9 往上抬时角度位置值增大，右边 12/15/18 往上抬时角度位置值减小。",
-    "角度换算已确认：deg = (pos - 512) * 0.24；髋 512 → 左腿 +45° / 右腿 -45°，大腿 512 → 0°(水平)，小腿 512 → +45°(相对大腿下偏)。详见 angle_conventions 与 position_to_angle_formula。",
-    "物理限位：髋 ±45°（左腿位置 137-512、右腿 512-887），大腿 ±90°（位置 137-887），小腿无额外限位（0-1024；舵机规格有效范围 0-1000，超出可能被钳制）。详见 joint_limits。"
+    "角度换算已确认：deg = (pos - 512) * 0.24；髋关节在 512 位置时各腿指向不同（前 ±45°、中 ±90°、后 ±135°，见 hip_anchor_direction_deg），大腿 512 → 0°(水平)，小腿 512 → +45°(相对大腿下偏)。详见 angle_conventions 与 position_to_angle_formula。",
+    "当前实际关节限位：髋位置 300–700、大腿位置 100–900、小腿 0–1023（舵机 10 位量程）；详见 joint_limits。",
+    "髋关节安装朝向已实机验证：位置 512 时前腿 ±45°、中腿 ±90°、后腿 ±135°（见 hip_anchor_direction_deg）；自然站立方向在此基础上再向身体前方偏 5°。三角步态实机行走稳定。"
   ]
 }
