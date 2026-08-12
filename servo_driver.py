@@ -29,6 +29,7 @@ import json
 import math
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import serial
@@ -48,17 +49,17 @@ CONFIG_PATH = Path(__file__).resolve().with_name("physical_config.json")
 
 # ---------------------------------------------------------------- 步态参数
 
-WALK_SPEED_DEFAULT = 30.0      # mm/s，正数前进、负数后退
-WALK_SPEED_LIMIT = 90.0        # mm/s
-WALK_STRIDE_DEFAULT = 60.0     # mm，足端在每个支撑/摆动相内扫过的距离（前后各摆 stride/2）
+WALK_SPEED_DEFAULT = 240.0      # mm/s，正数前进、负数后退
+WALK_SPEED_LIMIT = 500.0        # mm/s
+WALK_STRIDE_DEFAULT = 90.0     # mm，足端在每个支撑/摆动相内扫过的距离（前后各摆 stride/2）
 STRAFE_SPEED_DEFAULT = WALK_SPEED_DEFAULT
-STRAFE_STRIDE_DEFAULT = 60.0   # mm，横向移动时足端在每个支撑/摆动相内扫过的左右距离
-TURN_SPEED_DEFAULT = 20.0      # deg/s，正数俯视逆时针（左转）、负数右转
-TURN_SPEED_LIMIT = 30.0        # deg/s
-TURN_STEP_DEFAULT = 10.0       # deg，每个步态周期身体旋转的角度（左右各转 step/2）
+STRAFE_STRIDE_DEFAULT = 90.0   # mm，横向移动时足端在每个支撑/摆动相内扫过的左右距离
+TURN_SPEED_DEFAULT = 50.0      # deg/s，正数俯视逆时针（左转）、负数右转
+TURN_SPEED_LIMIT = 100.0        # deg/s
+TURN_STEP_DEFAULT = 15.0       # deg，每个步态周期身体旋转的角度（左右各转 step/2）
 WALK_FRAME_PERIOD = 0.10       # s，帧周期
 WALK_MOVE_TIME_MS = 90         # 每帧舵机移动时间，适配 9600 串口带宽
-WALK_STAND_MOVE_TIME_MS = 800  # 启动/停止时回到自然站立的移动时间
+WALK_STAND_MOVE_TIME_MS = 300  # 启动/停止时回到自然站立的移动时间
 
 # ---------------------------------------------------------------- 内置数据
 
@@ -293,7 +294,9 @@ def quantize_pose(pose: dict[int, float]) -> list[tuple[int, int]]:
 
 
 def cmd_gait(ser: serial.Serial, speed_mm_s: float,
-             stride_mm: float | None, *, lateral: bool):
+             stride_mm: float | None, *, lateral: bool,
+             should_stop: Callable[[], bool] | None = None,
+             stand_first: bool = True):
     """以三角步态前后行走或左右平移，Ctrl+C 停止并回到自然站立姿态。
 
     lateral=False 时走前后方向：speed_mm_s 正值前进、负值后退；
@@ -303,7 +306,11 @@ def cmd_gait(ser: serial.Serial, speed_mm_s: float,
     不做钳制，超出腿部工作空间时由 IK 抛 UnreachableFootError。
     周期 T = 2*stride/speed，支撑相内足端相对身体反向移动 stride，保证足端
     在地面不打滑。启动时先发送自然站立姿态，随后步幅在约 1.5 个周期内
-    从 0 平滑爬升。
+    从 0 平滑爬升。should_stop 为可选回调，每个步态帧检查一次，返回 True
+    时不会立即中断步态，而是走完当前半步、把步幅平滑降到 0，等当前摆动
+    组落地后停在自然站立姿态，避免回拉。stand_first=False 时跳过启动前
+    的站立流程直接进入步态循环，适用于机器人已经处于自然站立姿态的场景
+    （步态第一帧本来就是站立姿态，爬升过程会平滑过渡）。
     """
     speed = float(speed_mm_s)
     if not math.isfinite(speed):
@@ -347,29 +354,68 @@ def cmd_gait(ser: serial.Serial, speed_mm_s: float,
           f"步幅 {stride:g} mm，周期 {cycle_s:.3f} s。"
           f"按 Ctrl+C 停止。")
 
-    # 先站到自然姿态，再进入步态循环
-    send_move(ser, quantize_pose(stand_pose), WALK_STAND_MOVE_TIME_MS)
-    try:
-        time.sleep(1.0)
-    except KeyboardInterrupt:
-        print("步态启动被中断，保持自然站立姿态。")
-        return
+    if stand_first:
+        # 先站到自然姿态，再进入步态循环
+        send_move(ser, quantize_pose(stand_pose), WALK_STAND_MOVE_TIME_MS)
+        wait_s = WALK_STAND_MOVE_TIME_MS / 1000 + 0.1
+        try:
+            deadline = time.monotonic() + wait_s
+            while time.monotonic() < deadline:
+                if should_stop is not None and should_stop():
+                    print("\n步态启动被取消，保持自然站立姿态。")
+                    return
+                time.sleep(0.02)
+        except KeyboardInterrupt:
+            print("步态启动被中断，保持自然站立姿态。")
+            return
 
+    stride_target = math.copysign(stride, speed)
     start = time.monotonic()
+    # 停止阶段状态：收到停止信号后不立即回中，而是走完当前半步，
+    # 同时把步幅平滑降到 0；到达半步边界时当前摆动组正好落地，
+    # 全足着地且处于自然站立姿态，避免中断步态造成的“往回拉”。
+    stopping = False
+    stop_phase = 0.0
+    stride_at_stop = 0.0
+    finish_span = 0.5
     try:
         while True:
             frame_start = time.monotonic()
             elapsed = frame_start - start
             phase = (elapsed / cycle_s) % 1.0
 
-            # 约 1.5 个周期内把步幅从 0 平滑爬升到目标值
-            ramp_progress = min(1.0, elapsed / ramp_s)
-            smooth = ramp_progress * ramp_progress * (3 - 2 * ramp_progress)
-            stride_now = math.copysign(stride * smooth, speed)
+            if stopping:
+                progress = ((phase - stop_phase) % 1.0) / finish_span
+                t = min(1.0, progress)
+                decel = 1.0 - (t * t * (3.0 - 2.0 * t))
+                stride_now = stride_at_stop * decel
+            elif should_stop is not None and should_stop():
+                print("\n收到停止信号，走完当前一步后停下。")
+                stopping = True
+                stop_phase = phase
+                ramp_progress = min(1.0, elapsed / ramp_s)
+                smooth = ramp_progress * ramp_progress * (3 - 2 * ramp_progress)
+                stride_at_stop = stride_target * smooth
+                # 目标为下一个半步边界（0.5 相位），即当前摆动组落地瞬间
+                finish_span = math.ceil(phase * 2.0) / 2.0 - phase
+                if finish_span < 0.05:
+                    finish_span += 0.5
+                stride_now = stride_at_stop
+            else:
+                # 约 1.5 个周期内把步幅从 0 平滑爬升到目标值
+                ramp_progress = min(1.0, elapsed / ramp_s)
+                smooth = ramp_progress * ramp_progress * (3 - 2 * ramp_progress)
+                stride_now = stride_target * smooth
+
             if lateral:
                 pose = gait.pose_at(phase, 0.0, stride_now)
             else:
                 pose = gait.pose_at(phase, stride_now)
+
+            if stopping and ((phase - stop_phase) % 1.0) >= finish_span:
+                # 步幅已降到 0，摆动组已落地：当前姿态就是自然站立，
+                # 直接交给 finally 稳住即可
+                break
             send_move(ser, quantize_pose(pose), WALK_MOVE_TIME_MS)
 
             delay = frame_start + WALK_FRAME_PERIOD - time.monotonic()
@@ -381,25 +427,33 @@ def cmd_gait(ser: serial.Serial, speed_mm_s: float,
         send_move(ser, quantize_pose(stand_pose), WALK_STAND_MOVE_TIME_MS)
         print("步态已停止，已回到自然站立姿态。")
         try:
-            time.sleep(1.0)
+            time.sleep(WALK_STAND_MOVE_TIME_MS / 1000 + 0.1)
         except KeyboardInterrupt:
             print()
 
 
 def cmd_walk(ser: serial.Serial, speed_mm_s: float,
-             stride_mm: float | None = None):
+             stride_mm: float | None = None,
+             *, should_stop: Callable[[], bool] | None = None,
+             stand_first: bool = True):
     """以三角步态前后行走；参数含义见 cmd_gait。"""
-    cmd_gait(ser, speed_mm_s, stride_mm, lateral=False)
+    cmd_gait(ser, speed_mm_s, stride_mm, lateral=False,
+             should_stop=should_stop, stand_first=stand_first)
 
 
 def cmd_strafe(ser: serial.Serial, speed_mm_s: float,
-               stride_mm: float | None = None):
+               stride_mm: float | None = None,
+               *, should_stop: Callable[[], bool] | None = None,
+               stand_first: bool = True):
     """以三角步态左右平移（正数左移、负数右移）；参数含义见 cmd_gait。"""
-    cmd_gait(ser, speed_mm_s, stride_mm, lateral=True)
+    cmd_gait(ser, speed_mm_s, stride_mm, lateral=True,
+             should_stop=should_stop, stand_first=stand_first)
 
 
 def cmd_turn(ser: serial.Serial, speed_deg_s: float,
-             step_deg: float | None = None):
+             step_deg: float | None = None,
+             *, should_stop: Callable[[], bool] | None = None,
+             stand_first: bool = True):
     """以三角步态原地旋转，Ctrl+C 停止并回到自然站立姿态。
 
     speed_deg_s 为正值时俯视逆时针（左转）、负值时顺时针（右转），
@@ -408,7 +462,10 @@ def cmd_turn(ser: serial.Serial, speed_deg_s: float,
     UnreachableFootError。
     周期 T = 2*step/speed：支撑相内身体旋转 step、足端相对身体反向旋转
     step，保证足端在地面不打滑。启动时先发送自然站立姿态，随后转角在
-    约 1.5 个周期内从 0 平滑爬升。
+    约 1.5 个周期内从 0 平滑爬升。should_stop 为可选回调，每个步态帧
+    检查一次，返回 True 时走完当前半步、把转角平滑降到 0，等当前摆动组
+    落地后停在自然站立姿态。stand_first=False 时跳过启动前的站立流程
+    直接进入旋转循环，适用于机器人已经处于自然站立姿态的场景。
     """
     speed = float(speed_deg_s)
     if not math.isfinite(speed):
@@ -447,27 +504,61 @@ def cmd_turn(ser: serial.Serial, speed_deg_s: float,
           f"单周期转角 {step:g}°，周期 {cycle_s:.3f} s。"
           f"按 Ctrl+C 停止。")
 
-    # 先站到自然姿态，再进入旋转步态循环
-    send_move(ser, quantize_pose(stand_pose), WALK_STAND_MOVE_TIME_MS)
-    try:
-        time.sleep(1.0)
-    except KeyboardInterrupt:
-        print("旋转启动被中断，保持自然站立姿态。")
-        return
+    if stand_first:
+        # 先站到自然姿态，再进入旋转步态循环
+        send_move(ser, quantize_pose(stand_pose), WALK_STAND_MOVE_TIME_MS)
+        wait_s = WALK_STAND_MOVE_TIME_MS / 1000 + 0.1
+        try:
+            deadline = time.monotonic() + wait_s
+            while time.monotonic() < deadline:
+                if should_stop is not None and should_stop():
+                    print("\n旋转启动被取消，保持自然站立姿态。")
+                    return
+                time.sleep(0.02)
+        except KeyboardInterrupt:
+            print("旋转启动被中断，保持自然站立姿态。")
+            return
 
+    step_target = math.copysign(step, speed)
     start = time.monotonic()
+    # 停止阶段状态：收到停止信号后走完当前半步，转角平滑降到 0，
+    # 到达半步边界时当前摆动组正好落地，全足着地且处于自然站立姿态。
+    stopping = False
+    stop_phase = 0.0
+    step_at_stop = 0.0
+    finish_span = 0.5
     try:
         while True:
             frame_start = time.monotonic()
             elapsed = frame_start - start
             phase = (elapsed / cycle_s) % 1.0
 
-            # 约 1.5 个周期内把单周期转角从 0 平滑爬升到目标值
-            ramp_progress = min(1.0, elapsed / ramp_s)
-            smooth = ramp_progress * ramp_progress * (3 - 2 * ramp_progress)
-            step_now = math.copysign(step * smooth, speed)
+            if stopping:
+                progress = ((phase - stop_phase) % 1.0) / finish_span
+                t = min(1.0, progress)
+                decel = 1.0 - (t * t * (3.0 - 2.0 * t))
+                step_now = step_at_stop * decel
+            elif should_stop is not None and should_stop():
+                print("\n收到停止信号，走完当前一步后停下。")
+                stopping = True
+                stop_phase = phase
+                ramp_progress = min(1.0, elapsed / ramp_s)
+                smooth = ramp_progress * ramp_progress * (3 - 2 * ramp_progress)
+                step_at_stop = step_target * smooth
+                finish_span = math.ceil(phase * 2.0) / 2.0 - phase
+                if finish_span < 0.05:
+                    finish_span += 0.5
+                step_now = step_at_stop
+            else:
+                # 约 1.5 个周期内把单周期转角从 0 平滑爬升到目标值
+                ramp_progress = min(1.0, elapsed / ramp_s)
+                smooth = ramp_progress * ramp_progress * (3 - 2 * ramp_progress)
+                step_now = step_target * smooth
 
             pose = GAIT.turn_pose_at(phase, math.radians(step_now))
+
+            if stopping and ((phase - stop_phase) % 1.0) >= finish_span:
+                break
             send_move(ser, quantize_pose(pose), WALK_MOVE_TIME_MS)
 
             delay = frame_start + WALK_FRAME_PERIOD - time.monotonic()
@@ -479,7 +570,7 @@ def cmd_turn(ser: serial.Serial, speed_deg_s: float,
         send_move(ser, quantize_pose(stand_pose), WALK_STAND_MOVE_TIME_MS)
         print("旋转已停止，已回到自然站立姿态。")
         try:
-            time.sleep(1.0)
+            time.sleep(WALK_STAND_MOVE_TIME_MS / 1000 + 0.1)
         except KeyboardInterrupt:
             print()
 
