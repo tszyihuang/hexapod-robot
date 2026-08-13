@@ -4,12 +4,13 @@
 主循环持续检测键盘状态并覆盖打印（按下为大写、松开为小写）。W/S/A/D
 表示前后左右移动，Q/E 表示原地旋转（Q 逆时针、E 顺时针）。任一按键从
 松开变为按下时，只启动一次对应的步态线程；按键松开或切换动作时停止
-当前步态并回到自然站立姿态。同时按下多个方向键时按
-W > S > A > D > Q > E 的优先级取一个动作。按 ESC 退出，退出前自动失能
-全部舵机。
+当前步态并回到自然站立姿态。斜向组合：W+A 左前方、W+D 右前方、S+A
+左后方、S+D 右后方（斜向时两个分量各取速度的 √2/2，合速度与单方向
+一致）。按 ESC 退出，退出前自动失能全部舵机。
 """
 
 import argparse
+import math
 import sys
 import threading
 import time
@@ -26,19 +27,36 @@ REFRESH_INTERVAL = 0.02
 
 def desired_action(pressed: dict[str, bool], ser: serial.Serial,
                    speed: float, turn_speed: float):
-    """返回 (方向名, 按键, 步态函数, 参数)；无方向键按下返回 None。"""
+    """返回 (方向名, 参与按键列表, 步态函数, 参数)；无方向键按下返回 None。
+
+    斜向组合优先于单方向键：W+A 左前方、W+D 右前方、S+A 左后方、
+    S+D 右后方。斜向两个分量各取 speed*√2/2，保证合速度与单方向一致。
+    """
+    diag = speed * math.sqrt(2.0) / 2.0
+    if pressed["w"] and pressed["a"]:
+        return ("左前方", ["w", "a"], servo_driver.cmd_move,
+                (ser, diag, diag, None))
+    if pressed["w"] and pressed["d"]:
+        return ("右前方", ["w", "d"], servo_driver.cmd_move,
+                (ser, diag, -diag, None))
+    if pressed["s"] and pressed["d"]:
+        return ("右后方", ["s", "d"], servo_driver.cmd_move,
+                (ser, -diag, -diag, None))
+    if pressed["s"] and pressed["a"]:
+        return ("左后方", ["s", "a"], servo_driver.cmd_move,
+                (ser, -diag, diag, None))
     if pressed["w"]:
-        return "前进", "w", servo_driver.cmd_walk, (ser, speed, None)
+        return "前进", ["w"], servo_driver.cmd_walk, (ser, speed, None)
     if pressed["s"]:
-        return "后退", "s", servo_driver.cmd_walk, (ser, -speed, None)
+        return "后退", ["s"], servo_driver.cmd_walk, (ser, -speed, None)
     if pressed["a"]:
-        return "左移", "a", servo_driver.cmd_strafe, (ser, speed, None)
+        return "左移", ["a"], servo_driver.cmd_strafe, (ser, speed, None)
     if pressed["d"]:
-        return "右移", "d", servo_driver.cmd_strafe, (ser, -speed, None)
+        return "右移", ["d"], servo_driver.cmd_strafe, (ser, -speed, None)
     if pressed["q"]:
-        return "逆时针旋转", "q", servo_driver.cmd_turn, (ser, turn_speed, None)
+        return "逆时针旋转", ["q"], servo_driver.cmd_turn, (ser, turn_speed, None)
     if pressed["e"]:
-        return "顺时针旋转", "e", servo_driver.cmd_turn, (ser, -turn_speed, None)
+        return "顺时针旋转", ["e"], servo_driver.cmd_turn, (ser, -turn_speed, None)
     return None
 
 
@@ -70,16 +88,17 @@ def main():
     ser.rts = False
     time.sleep(0.1)
 
-    # 当前步态线程、它的停止信号、以及它对应的方向按键
+    # 当前步态线程、它的停止信号、以及它对应的方向按键组合
     gait_thread: threading.Thread | None = None
     gait_stop: threading.Event | None = None
-    active_key: str | None = None
+    active_keys: tuple[str, ...] | None = None
     # 机器人是否已处于自然站立姿态：首次按方向键需要先站立，
     # 之后每次步态结束都会回到站立，可直接进入步态循环，省掉约 1.8 秒
     robot_standing = False
 
     print("键盘控制已启动：W 前进、S 后退、A 左移、D 右移、"
-          "Q 逆时针、E 顺时针，松开停止，按 ESC 退出。")
+          "Q 逆时针、E 顺时针；W+A 左前、W+D 右前、S+A 左后、S+D 右后，"
+          "松开停止，按 ESC 退出。")
     try:
         while True:
             pressed = {key: keyboard.is_pressed(key) for key in KEYS}
@@ -88,26 +107,27 @@ def main():
 
             desired = desired_action(pressed, ser, args.speed,
                                      args.turn_speed)
-            desired_key = desired[1] if desired else None
+            desired_keys = tuple(desired[1]) if desired else None
 
             # 方向没变就不动；变了就先停旧步态、再启动新步态
-            if desired_key != active_key:
+            if desired_keys != active_keys:
                 if gait_stop is not None:
                     gait_stop.set()
                 if gait_thread is not None and gait_thread.is_alive():
                     gait_thread.join(timeout=5)
 
                 if desired is None:
-                    active_key = None
+                    active_keys = None
                     gait_thread = None
                     gait_stop = None
                 else:
-                    label, key, target, fargs = desired
+                    label, keys, target, fargs = desired
                     gait_stop = threading.Event()
 
                     def should_stop(ev: threading.Event = gait_stop,
-                                    k: str = key) -> bool:
-                        return ev.is_set() or not keyboard.is_pressed(k)
+                                    ks: tuple[str, ...] = tuple(keys)) -> bool:
+                        return ev.is_set() or not all(
+                            keyboard.is_pressed(k) for k in ks)
 
                     gait_thread = threading.Thread(
                         target=target,
@@ -118,7 +138,7 @@ def main():
                         },
                         daemon=True,
                     )
-                    active_key = key
+                    active_keys = tuple(keys)
                     robot_standing = True  # 本次步态结束时必定回到自然站立
                     print(f"\n开始{label}。")
                     gait_thread.start()
