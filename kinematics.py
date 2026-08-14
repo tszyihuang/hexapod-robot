@@ -18,7 +18,7 @@
   - 小腿(tibia)：相对大腿轴线向下偏为正（kappa），0° = 与大腿同向伸直。
 
 IK 求解返回的是未量化的浮点舵机位置（0-1000 有效量程），由上层在
-串口发送前四舍五入，避免取整误差累积后超出回环测试的 0.5 mm 精度要求。
+串口发送前四舍五入，避免取整误差累积。
 
 三角步态（TripodGait）：
   - A 组：腿 1（左后）、腿 3（左前）、腿 5（右中），相位偏移 0
@@ -118,7 +118,7 @@ class HexapodIK:
                 self.sides[int(leg_id)] = "left" if side == "left" else "right"
 
         # 腿 id -> 髋舵机在 512 位置时腿的指向（身体坐标，度）
-        # 每条腿的髋舵机安装朝向不同，缺省时退回旧的左右 ±45° 约定
+        # 每条腿的髋舵机安装朝向不同，缺省时按左右 ±45° 约定
         anchors = self.config.get("hip_anchor_direction_deg", {})
         self.hip_anchors: dict[int, float] = {}
         for leg_id in self.legs:

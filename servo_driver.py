@@ -36,14 +36,10 @@ from collections.abc import Callable
 import serial
 
 from kinematics import HexapodIK, TripodGait, UnreachableFootError
-
-PORT = "/dev/ttyUSB0"
-BAUD = 115200
-
-CMD_SERVO_MOVE_TIME_WRITE = 0x01
-CMD_SERVO_ID_READ = 0x0E
-CMD_SERVO_POS_READ = 0x1C
-CMD_SERVO_LOAD_OR_UNLOAD_WRITE = 0x1F
+from servo_protocol import (BAUD, CMD_SERVO_LOAD_OR_UNLOAD_WRITE,
+                            CMD_SERVO_MOVE_TIME_WRITE, CMD_SERVO_POS_READ,
+                            PORT, drain_until_quiet, open_serial,
+                            send_command, write_commands)
 
 SERVO_IDS = list(range(1, 19))
 
@@ -57,9 +53,13 @@ STRAFE_STRIDE_DEFAULT = 100.0   # mm，横向移动时足端在每个支撑/摆�
 TURN_SPEED_DEFAULT = 80.0      # deg/s，正数俯视逆时针（左转）、负数右转
 TURN_SPEED_LIMIT = 100.0        # deg/s
 TURN_STEP_DEFAULT = 20.0       # deg，每个步态周期身体旋转的角度（左右各转 step/2）
-WALK_FRAME_PERIOD = 0.10       # s，帧周期
-WALK_MOVE_TIME_MS = 90         # 每帧舵机移动时间，适配直连串口带宽（18 帧 @115200）
+WALK_FRAME_PERIOD = 0.02       # s，帧周期：50Hz 稳定指令下达
+WALK_MOVE_TIME_MS = 20         # 每帧舵机移动时间，与 20ms 帧周期一致（18 帧 @115200 线上约 15.6ms）
 WALK_STAND_MOVE_TIME_MS = 100  # 启动/停止时回到自然站立的移动时间
+
+# 每帧末尾提前醒来、用忙等补齐剩余时间的余量；把 20ms 帧间隔抖动压到
+# 毫秒级以内，而不是依赖 time.sleep 的调度粒度。
+WALK_SCHEDULE_AHEAD_S = 0.0015
 
 # ---------------------------------------------------------------- 内置数据
 
@@ -79,105 +79,10 @@ FLATTEN_POSE = {
     sid: int(IK.config.get("default_flatten_position", 512)) for sid in SERVO_IDS
 }
 
-# ---------------------------------------------------------------- 串口协议
+# ---------------------------------------------------------------- 舵机读写
 
-def open_serial(port: str, baud: int) -> serial.Serial:
-    """打开串口（8N1），关闭 DTR/RTS 并等待 USB 总线模块稳定。
-
-    打开失败抛 serial.SerialException，由调用方决定如何提示与退出。
-    """
-    ser = serial.Serial(port=port, baudrate=baud, bytesize=8, parity="N",
-                        stopbits=1, timeout=0.2, write_timeout=1)
-    ser.dtr = False
-    ser.rts = False
-    time.sleep(0.1)
-    return ser
-
-
-def build_frame(servo_id: int, cmd: int,
-                params: tuple[int, ...] = ()) -> bytes:
-    """构造直连协议帧：0x55 0x55 | ID | 长度 | 指令 | 参数 | 校验和。
-
-    长度 = 参数个数 + 3；校验和 = ~(ID + 长度 + 指令 + 参数之和) 低 8 位。
-    """
-    length = len(params) + 3
-    frame = bytearray([0x55, 0x55, servo_id, length, cmd])
-    frame += bytes(params)
-    frame.append((~sum(frame[2:])) & 0xFF)
-    return bytes(frame)
-
-
-def iter_frames(data: bytes):
-    """从数据流中切出校验和合法的完整应答帧。"""
-    i = 0
-    n = len(data)
-    while i + 6 <= n:
-        if data[i : i + 2] != b"\x55\x55":
-            i += 1
-            continue
-        length = data[i + 3]
-        total = length + 3
-        if length < 3 or i + total > n:
-            i += 1
-            continue
-        frame = data[i:i + total]
-        if (~sum(frame[2:-1]) & 0xFF) == frame[-1]:
-            yield frame
-        i += 1
-
-
-def send_command(ser: serial.Serial, servo_id: int, cmd: int,
-                 params: tuple[int, ...] = (), wait_s: float = 0.08,
-                 timeout_s: float = 0.02) -> bytes | None:
-    """发送指令并读取该舵机的应答，超时返回 None。
-
-    只返回 ID 与指令都匹配、且校验和合法的完整应答帧；移动/卸载等
-    写指令通常无应答，应使用 write_command。
-    """
-    frame = build_frame(servo_id, cmd, params)
-    old_timeout = ser.timeout
-    ser.timeout = timeout_s
-    try:
-        ser.reset_input_buffer()
-        ser.write(frame)
-        ser.flush()
-        data = b""
-        deadline = time.time() + wait_s
-        while time.time() < deadline:
-            chunk = ser.read(4096)
-            if chunk:
-                data += chunk
-                for candidate in iter_frames(data):
-                    if candidate[2] == servo_id and candidate[4] == cmd:
-                        return candidate
-        return None
-    finally:
-        ser.timeout = old_timeout
-
-
-def write_command(ser: serial.Serial, servo_id: int, cmd: int,
-                  params: tuple[int, ...] = ()):
-    """发送写指令（无应答），不读取串口。"""
-    ser.write(build_frame(servo_id, cmd, params))
-    ser.flush()
-
-
-def drain_until_quiet(ser: serial.Serial, quiet_s: float = 0.02,
-                      max_wait_s: float = 0.25):
-    """把串口里仍在到达的数据完整读走，避免残留帧造成错位。"""
-    old_timeout = ser.timeout
-    ser.timeout = 0.02
-    try:
-        deadline = time.time() + max_wait_s
-        while time.time() < deadline:
-            chunk = ser.read(4096)
-            if chunk:
-                continue
-            time.sleep(quiet_s)
-            if not ser.in_waiting:
-                break
-    finally:
-        ser.timeout = old_timeout
+# 协议帧的构造/解析/收发统一在 servo_protocol.py；这里只封装
+# 「读位置」「移动」「加载/卸载」三类高层操作。
 
 
 def read_servos(ser: serial.Serial, ids: list[int],
@@ -218,30 +123,30 @@ def send_move(ser: serial.Serial, servos: list[tuple[int, int]], time_ms: int):
 
     直连协议没有多舵机移动指令，这里把所有单舵机移动帧拼成一次写入，
     保证 18 个舵机收到几乎相同的起始时间。时间参数范围 0-30000ms。
+
+    50Hz 控制环每帧只有 20ms，若等待整块 180 字节物理发完（约 15.6ms）
+    会挤占几乎整个周期，因此此处不 flush，由内核缓冲以线速率自然发出。
     """
     time_ms = max(0, min(int(time_ms), 30000))
-    block = bytearray()
+    commands = []
     for servo_id, pos in servos:
         pos = max(0, min(int(pos), 1000))
-        block += build_frame(
-            servo_id, CMD_SERVO_MOVE_TIME_WRITE,
-            (pos & 0xFF, (pos >> 8) & 0xFF,
-             time_ms & 0xFF, (time_ms >> 8) & 0xFF))
-    if block:
-        ser.write(bytes(block))
-        ser.flush()
+        commands.append((servo_id, CMD_SERVO_MOVE_TIME_WRITE,
+                         (pos & 0xFF, (pos >> 8) & 0xFF,
+                           time_ms & 0xFF, (time_ms >> 8) & 0xFF)))
+    write_commands(ser, commands, flush=False)
 
 
 def unload_servos(ser: serial.Serial, ids: list[int]):
     """卸载（失能）所有舵机，参数 0 = 关闭扭矩。"""
-    for servo_id in ids:
-        write_command(ser, servo_id, CMD_SERVO_LOAD_OR_UNLOAD_WRITE, (0x00,))
+    write_commands(ser, [(servo_id, CMD_SERVO_LOAD_OR_UNLOAD_WRITE, (0x00,))
+                         for servo_id in ids])
 
 
 def load_servos(ser: serial.Serial, ids: list[int]):
     """加载（使能）所有舵机，参数 1 = 打开扭矩。"""
-    for servo_id in ids:
-        write_command(ser, servo_id, CMD_SERVO_LOAD_OR_UNLOAD_WRITE, (0x01,))
+    write_commands(ser, [(servo_id, CMD_SERVO_LOAD_OR_UNLOAD_WRITE, (0x01,))
+                         for servo_id in ids])
 
 
 # ---------------------------------------------------------------- 姿态数据
@@ -359,6 +264,15 @@ def _wait_stand_complete(should_stop: Callable[[], bool] | None,
     return True
 
 
+def _stand_up(ser: serial.Serial, stand_pose: dict[int, float],
+              name: str, should_stop: Callable[[], bool] | None) -> bool:
+    """加载扭矩并站到自然姿态；返回 False 表示被取消，应中止步态。"""
+    load_servos(ser, SERVO_IDS)
+    send_move(ser, quantize_pose(stand_pose), WALK_STAND_MOVE_TIME_MS)
+    return _wait_stand_complete(
+        should_stop, WALK_STAND_MOVE_TIME_MS / 1000 + 0.1, name)
+
+
 def _run_gait_loop(ser: serial.Serial, pose_fn: Callable[..., dict[int, float]],
                    target_amps: tuple[float, ...],
                    stand_pose: dict[int, float],
@@ -372,6 +286,9 @@ def _run_gait_loop(ser: serial.Serial, pose_fn: Callable[..., dict[int, float]],
     不立即回中，而是走完当前半步、把幅值平滑降到 0，等当前摆动组落地后
     停在自然站立姿态，避免中断步态造成的“往回拉”。任何退出路径（Ctrl+C、
     IK 越界、异常）都会回到自然站立姿态。
+
+    指令按固定帧周期 WALK_FRAME_PERIOD（默认 50Hz）下达：每帧末尾先
+    sleep 到临近截止时间，再用忙等补齐，避免调度粒度造成帧间隔抖动。
     """
     start = time.monotonic()
     stopping = False
@@ -413,9 +330,13 @@ def _run_gait_loop(ser: serial.Serial, pose_fn: Callable[..., dict[int, float]],
                 break
             send_move(ser, quantize_pose(pose), WALK_MOVE_TIME_MS)
 
-            delay = frame_start + WALK_FRAME_PERIOD - time.monotonic()
+            deadline = frame_start + WALK_FRAME_PERIOD
+            delay = deadline - time.monotonic()
             if delay > 0:
-                time.sleep(delay)
+                if delay > WALK_SCHEDULE_AHEAD_S:
+                    time.sleep(delay - WALK_SCHEDULE_AHEAD_S)
+                while time.monotonic() < deadline:
+                    pass
     except KeyboardInterrupt:
         print()
     except UnreachableFootError as exc:
@@ -484,14 +405,8 @@ def cmd_move(ser: serial.Serial, vx_mm_s: float, vy_mm_s: float,
           f"vx {vx:+.1f}，vy {vy:+.1f}），步幅 {stride:g} mm，"
           f"周期 {cycle_s:.3f} s。按 Ctrl+C 停止。")
 
-    if stand_first:
-        # 先站到自然姿态，再进入步态循环
-        load_servos(ser, SERVO_IDS)
-        send_move(ser, quantize_pose(stand_pose), WALK_STAND_MOVE_TIME_MS)
-        if not _wait_stand_complete(should_stop,
-                                    WALK_STAND_MOVE_TIME_MS / 1000 + 0.1,
-                                    "步态"):
-            return
+    if stand_first and not _stand_up(ser, stand_pose, "步态", should_stop):
+        return
 
     _run_gait_loop(ser, GAIT.pose_at, (stride_target_x, stride_target_y),
                    stand_pose, cycle_s, ramp_s, "步态", should_stop)
@@ -584,14 +499,8 @@ def cmd_turn(ser: serial.Serial, speed_deg_s: float,
           f"单周期转角 {step:g}°，周期 {cycle_s:.3f} s。"
           f"按 Ctrl+C 停止。")
 
-    if stand_first:
-        # 先站到自然姿态，再进入旋转步态循环
-        load_servos(ser, SERVO_IDS)
-        send_move(ser, quantize_pose(stand_pose), WALK_STAND_MOVE_TIME_MS)
-        if not _wait_stand_complete(should_stop,
-                                    WALK_STAND_MOVE_TIME_MS / 1000 + 0.1,
-                                    "旋转"):
-            return
+    if stand_first and not _stand_up(ser, stand_pose, "旋转", should_stop):
+        return
 
     step_target = math.copysign(step, speed)
     _run_gait_loop(ser,

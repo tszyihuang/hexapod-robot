@@ -21,64 +21,10 @@ import time
 
 import serial
 
-PORT = "/dev/ttyUSB0"
-BAUD = 115200
+from servo_protocol import (BAUD, CMD_SERVO_ID_READ, CMD_SERVO_POS_READ,
+                            PORT, open_serial, send_command)
+
 DEFAULT_IDS = "1-18"
-
-CMD_SERVO_ID_READ = 0x0E
-CMD_SERVO_POS_READ = 0x1C
-
-
-def build_frame(servo_id: int, cmd: int,
-                params: tuple[int, ...] = ()) -> bytes:
-    """构造直连协议帧：0x55 0x55 | ID | 长度 | 指令 | 参数 | 校验和。"""
-    length = len(params) + 3
-    frame = bytearray([0x55, 0x55, servo_id, length, cmd])
-    frame += bytes(params)
-    frame.append((~sum(frame[2:])) & 0xFF)
-    return bytes(frame)
-
-
-def iter_frames(data: bytes):
-    """从数据流中切出校验和合法的完整应答帧。"""
-    i, n = 0, len(data)
-    while i + 6 <= n:
-        if data[i:i + 2] != b"\x55\x55":
-            i += 1
-            continue
-        length = data[i + 3]
-        total = length + 3
-        if length < 3 or i + total > n:
-            i += 1
-            continue
-        frame = data[i:i + total]
-        if (~sum(frame[2:-1]) & 0xFF) == frame[-1]:
-            yield frame
-        i += 1
-
-
-def send_command(ser: serial.Serial, servo_id: int, cmd: int,
-                 wait_s: float = 0.08, timeout_s: float = 0.02
-                 ) -> bytes | None:
-    """发送只读指令并等待该舵机的合法应答，超时返回 None。"""
-    old_timeout = ser.timeout
-    ser.timeout = timeout_s
-    try:
-        ser.reset_input_buffer()
-        ser.write(build_frame(servo_id, cmd))
-        ser.flush()
-        data = b""
-        deadline = time.time() + wait_s
-        while time.time() < deadline:
-            chunk = ser.read(4096)
-            if chunk:
-                data += chunk
-                for frame in iter_frames(data):
-                    if frame[2] == servo_id and frame[4] == cmd:
-                        return frame
-        return None
-    finally:
-        ser.timeout = old_timeout
 
 
 def parse_ids(text: str) -> list[int]:
@@ -140,16 +86,12 @@ def main():
         parser.error("--interval 必须在 0-10 之间")
 
     try:
-        ser = serial.Serial(port=args.port, baudrate=args.baud, bytesize=8,
-                            parity="N", stopbits=1, timeout=0.2,
-                            write_timeout=1)
+        ser = open_serial(args.port, args.baud)
     except serial.SerialException as exc:
         print(f"无法打开串口 {args.port}: {exc}")
         print("请检查 USB 总线模块是否连接，或使用 --port 指定正确设备。")
         sys.exit(1)
-    ser.dtr = False
-    ser.rts = False
-    time.sleep(0.3)
+    time.sleep(0.2)
 
     print(f"监视 ID: {args.ids}  @ {args.baud} baud（只读，Ctrl+C 退出）")
     print("正在扫描在线舵机...")
