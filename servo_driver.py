@@ -7,10 +7,10 @@
   read     持续读取 1-18 号舵机位置并覆盖打印，无响应自动重试（Ctrl+C 停止）
   stand    让机器人站立（内置站立姿态）
   flatten  让机器人展平（内置展平姿态）
-  walk     以三角步态行走，可选速度 mm/s 与步幅 mm（默认 30 / 60，正数前进、负数后退）
-  strafe   以三角步态横向移动，可选速度 mm/s 与步幅 mm（默认 30 / 60，正数左移、负数右移）
-  move     以身体坐标系速度向量平移，可选 vx vy（mm/s，默认 200 0；vx 前正、vy 左正）
-  turn     原地旋转，可选角速度 deg/s 与单周期转角 deg（默认 20 / 10，正数左转、负数右转）
+  walk     以三角步态行走，可选速度 mm/s 与步幅 mm（默认 350 / 100，正数前进、负数后退）
+  strafe   以三角步态横向移动，可选速度 mm/s 与步幅 mm（默认 350 / 100，正数左移、负数右移）
+  move     以身体坐标系速度向量平移，可选 vx vy（mm/s，默认 350 0；vx 前正、vy 左正）
+  turn     原地旋转，可选角速度 deg/s 与单周期转角 deg（默认 80 / 20，正数左转、负数右转）
   relax    卸载所有舵机（失能，可手动转动）
   help     显示本帮助
   quit     退出程序（退出前自动失能全部舵机）
@@ -18,35 +18,34 @@
 站立/展平移动完成后舵机会保持通电并维持姿态；如果想让舵机失能、
 方便手动摆位，输入 relax。
 
-协议（Lobot 舵机控制板，9600 8N1）：
-  帧头 0x55 0x55 | 数据长度 | 指令 | 参数
-  0x15 = 多舵机位置读取
-  0x03 = 多舵机移动
-  0x14 = 多舵机卸载
+协议（LX-15D/LX-16A 串行总线舵机，USB 转总线模块直连，115200 8N1）：
+  帧格式 0x55 0x55 | ID | 长度 | 指令 | 参数 | 校验和
+  长度 = 参数个数 + 3；校验和 = ~(ID + 长度 + 指令 + 参数之和) 低 8 位
+  0x01 = 单舵机移动（含时间）
+  0x0E = 舵机 ID 查询
+  0x1C = 舵机位置读取
+  0x1F = 舵机加载/卸载（扭矩开关）
 """
 
 import argparse
-import json
 import math
 import sys
 import time
 from collections.abc import Callable
-from pathlib import Path
 
 import serial
 
-from kinematics import HexapodIK, TripodGait
+from kinematics import HexapodIK, TripodGait, UnreachableFootError
 
 PORT = "/dev/ttyUSB0"
-BAUD = 9600
+BAUD = 115200
 
-FRAME_HEADER = b"\x55\x55"
-CMD_MULT_SERVO_POS_READ = 0x15
-CMD_SERVO_MOVE = 0x03
-CMD_MULT_SERVO_UNLOAD = 0x14
+CMD_SERVO_MOVE_TIME_WRITE = 0x01
+CMD_SERVO_ID_READ = 0x0E
+CMD_SERVO_POS_READ = 0x1C
+CMD_SERVO_LOAD_OR_UNLOAD_WRITE = 0x1F
 
 SERVO_IDS = list(range(1, 19))
-CONFIG_PATH = Path(__file__).resolve().with_name("physical_config.json")
 
 # ---------------------------------------------------------------- 步态参数
 
@@ -59,7 +58,7 @@ TURN_SPEED_DEFAULT = 80.0      # deg/s，正数俯视逆时针（左转）、负
 TURN_SPEED_LIMIT = 100.0        # deg/s
 TURN_STEP_DEFAULT = 20.0       # deg，每个步态周期身体旋转的角度（左右各转 step/2）
 WALK_FRAME_PERIOD = 0.10       # s，帧周期
-WALK_MOVE_TIME_MS = 90         # 每帧舵机移动时间，适配 9600 串口带宽
+WALK_MOVE_TIME_MS = 90         # 每帧舵机移动时间，适配直连串口带宽（18 帧 @115200）
 WALK_STAND_MOVE_TIME_MS = 100  # 启动/停止时回到自然站立的移动时间
 
 # ---------------------------------------------------------------- 内置数据
@@ -75,42 +74,67 @@ def natural_stand_pose() -> dict[int, int]:
     return {int(sid): int(round(pos)) for sid, pos in GAIT.stand_pose().items()}
 
 
-# 展平姿态：所有舵机回到中位 512
-FLATTEN_POSE = {sid: 512 for sid in SERVO_IDS}
+# 展平姿态：所有舵机回到配置中的默认展平位置
+FLATTEN_POSE = {
+    sid: int(IK.config.get("default_flatten_position", 512)) for sid in SERVO_IDS
+}
 
 # ---------------------------------------------------------------- 串口协议
 
+def open_serial(port: str, baud: int) -> serial.Serial:
+    """打开串口（8N1），关闭 DTR/RTS 并等待 USB 总线模块稳定。
+
+    打开失败抛 serial.SerialException，由调用方决定如何提示与退出。
+    """
+    ser = serial.Serial(port=port, baudrate=baud, bytesize=8, parity="N",
+                        stopbits=1, timeout=0.2, write_timeout=1)
+    ser.dtr = False
+    ser.rts = False
+    time.sleep(0.1)
+    return ser
+
+
+def build_frame(servo_id: int, cmd: int,
+                params: tuple[int, ...] = ()) -> bytes:
+    """构造直连协议帧：0x55 0x55 | ID | 长度 | 指令 | 参数 | 校验和。
+
+    长度 = 参数个数 + 3；校验和 = ~(ID + 长度 + 指令 + 参数之和) 低 8 位。
+    """
+    length = len(params) + 3
+    frame = bytearray([0x55, 0x55, servo_id, length, cmd])
+    frame += bytes(params)
+    frame.append((~sum(frame[2:])) & 0xFF)
+    return bytes(frame)
+
+
 def iter_frames(data: bytes):
-    """按 0x55 0x55 帧头与长度字段切出数据流中的完整帧。"""
+    """从数据流中切出校验和合法的完整应答帧。"""
     i = 0
     n = len(data)
-    while i + 3 <= n:
-        if data[i : i + 2] == FRAME_HEADER:
-            end = i + 2 + data[i + 2]
-            if end <= n:
-                yield data[i:end]
-                i = end
-                continue
+    while i + 6 <= n:
+        if data[i : i + 2] != b"\x55\x55":
+            i += 1
+            continue
+        length = data[i + 3]
+        total = length + 3
+        if length < 3 or i + total > n:
+            i += 1
+            continue
+        frame = data[i:i + total]
+        if (~sum(frame[2:-1]) & 0xFF) == frame[-1]:
+            yield frame
         i += 1
 
 
-def send_frame(ser: serial.Serial, cmd: int, params: list[int],
-               wait_s: float = 0.35, timeout_s: float = 0.02) -> bytes:
-    """发送指令并读取应答，在数据流中找一条完整有效应答帧后返回。"""
-    frame = bytes([0x55, 0x55, len(params) + 2, cmd]) + bytes(params)
+def send_command(ser: serial.Serial, servo_id: int, cmd: int,
+                 params: tuple[int, ...] = (), wait_s: float = 0.08,
+                 timeout_s: float = 0.02) -> bytes | None:
+    """发送指令并读取该舵机的应答，超时返回 None。
 
-    def valid_response(data: bytes):
-        n_servos = params[0] if params else 0
-        for candidate in iter_frames(data):
-            if len(candidate) < 4 or candidate[3] != cmd:
-                continue
-            if cmd == CMD_MULT_SERVO_POS_READ:
-                if candidate[2] == n_servos * 3 + 3 and candidate[4] == n_servos:
-                    return candidate
-            else:
-                return candidate
-        return None
-
+    只返回 ID 与指令都匹配、且校验和合法的完整应答帧；移动/卸载等
+    写指令通常无应答，应使用 write_command。
+    """
+    frame = build_frame(servo_id, cmd, params)
     old_timeout = ser.timeout
     ser.timeout = timeout_s
     try:
@@ -123,12 +147,19 @@ def send_frame(ser: serial.Serial, cmd: int, params: list[int],
             chunk = ser.read(4096)
             if chunk:
                 data += chunk
-                found = valid_response(data)
-                if found is not None:
-                    return found
-        return data
+                for candidate in iter_frames(data):
+                    if candidate[2] == servo_id and candidate[4] == cmd:
+                        return candidate
+        return None
     finally:
         ser.timeout = old_timeout
+
+
+def write_command(ser: serial.Serial, servo_id: int, cmd: int,
+                  params: tuple[int, ...] = ()):
+    """发送写指令（无应答），不读取串口。"""
+    ser.write(build_frame(servo_id, cmd, params))
+    ser.flush()
 
 
 def drain_until_quiet(ser: serial.Serial, quiet_s: float = 0.02,
@@ -150,59 +181,67 @@ def drain_until_quiet(ser: serial.Serial, quiet_s: float = 0.02,
 
 
 def read_servos(ser: serial.Serial, ids: list[int],
-                wait_s: float = 0.35) -> list[tuple[int, int]]:
-    """读取多个舵机的位置，返回 [(舵机ID, 位置)]。"""
-    params = [len(ids)] + ids
-    data = send_frame(ser, CMD_MULT_SERVO_POS_READ, params, wait_s=wait_s)
+                wait_s: float = 0.08) -> list[tuple[int, int]]:
+    """逐个读取舵机位置，返回应答成功的 [(舵机ID, 位置)]。
+
+    直连协议没有多舵机批量读取指令，只能按 ID 逐个查询；不在总线上
+    的舵机会等到各自的超时时间，因此 18 个舵机全离线时一次全量读取
+    约需 wait_s * 18 秒。
+    """
     result = []
-    for frame in iter_frames(data):
-        if len(frame) < 5 or frame[3] != CMD_MULT_SERVO_POS_READ or frame[4] != len(ids):
+    for servo_id in ids:
+        frame = send_command(ser, servo_id, CMD_SERVO_POS_READ, wait_s=wait_s)
+        if frame is None or len(frame) < 8:
             continue
-        i = 5
-        for _ in range(frame[4]):
-            if i + 3 > len(frame):
-                break
-            result.append((frame[i], frame[i + 1] | (frame[i + 2] << 8)))
-            i += 3
+        pos = frame[5] | (frame[6] << 8)
+        result.append((servo_id, pos))
     return result
 
 
-RETRY_WAITS = (0.15, 0.35)
+RETRY_WAITS = (0.08, 0.20)
 
 
 def read_with_retry(ser: serial.Serial, ids: list[int],
                     waits: tuple[float, ...] = RETRY_WAITS) -> list[tuple[int, int]]:
-    """读取舵机位置，无响应时清空串口并用更长等待自动重试一次。"""
+    """读取舵机位置，未应答的舵机用更长等待自动重试一次。"""
     result = read_servos(ser, ids, wait_s=waits[0])
-    if result:
+    answered = {servo_id for servo_id, _ in result}
+    missing = [servo_id for servo_id in ids if servo_id not in answered]
+    if not missing:
         return result
     drain_until_quiet(ser)  # 清掉迟到/残留的半帧，避免污染重试结果
-    return read_servos(ser, ids, wait_s=waits[-1])
-
-
-def build_move_frame(servos: list[tuple[int, int]], time_ms: int) -> bytes:
-    """构造 0x03 多舵机移动指令帧。"""
-    n = len(servos)
-    frame = bytearray([0x55, 0x55, n * 3 + 5, CMD_SERVO_MOVE, n])
-    frame += bytes([time_ms & 0xFF, (time_ms >> 8) & 0xFF])
-    for servo_id, pos in servos:
-        frame += bytes([servo_id, pos & 0xFF, (pos >> 8) & 0xFF])
-    return bytes(frame)
+    return result + read_servos(ser, missing, wait_s=waits[-1])
 
 
 def send_move(ser: serial.Serial, servos: list[tuple[int, int]], time_ms: int):
-    frame = build_move_frame(servos, time_ms)
-    ser.reset_input_buffer()
-    ser.write(frame)
-    ser.flush()
+    """让多个舵机在 time_ms 毫秒内移动到各自位置（0x01，无应答）。
+
+    直连协议没有多舵机移动指令，这里把所有单舵机移动帧拼成一次写入，
+    保证 18 个舵机收到几乎相同的起始时间。时间参数范围 0-30000ms。
+    """
+    time_ms = max(0, min(int(time_ms), 30000))
+    block = bytearray()
+    for servo_id, pos in servos:
+        pos = max(0, min(int(pos), 1000))
+        block += build_frame(
+            servo_id, CMD_SERVO_MOVE_TIME_WRITE,
+            (pos & 0xFF, (pos >> 8) & 0xFF,
+             time_ms & 0xFF, (time_ms >> 8) & 0xFF))
+    if block:
+        ser.write(bytes(block))
+        ser.flush()
 
 
 def unload_servos(ser: serial.Serial, ids: list[int]):
-    frame = bytes([0x55, 0x55, len(ids) + 3,
-                   CMD_MULT_SERVO_UNLOAD, len(ids)]) + bytes(ids)
-    ser.reset_input_buffer()
-    ser.write(frame)
-    ser.flush()
+    """卸载（失能）所有舵机，参数 0 = 关闭扭矩。"""
+    for servo_id in ids:
+        write_command(ser, servo_id, CMD_SERVO_LOAD_OR_UNLOAD_WRITE, (0x00,))
+
+
+def load_servos(ser: serial.Serial, ids: list[int]):
+    """加载（使能）所有舵机，参数 1 = 打开扭矩。"""
+    for servo_id in ids:
+        write_command(ser, servo_id, CMD_SERVO_LOAD_OR_UNLOAD_WRITE, (0x01,))
 
 
 # ---------------------------------------------------------------- 姿态数据
@@ -219,25 +258,6 @@ def load_pose(data: dict) -> list[tuple[int, int]]:
             raise ValueError(f"舵机 {servo_id} 的位置超出范围: {pos}")
         servos.append((servo_id, pos))
     return sorted(servos)
-
-
-def load_leg_labels() -> dict[int, str]:
-    """从 physical_config.json 读取腿名映射，读不到时退回 legN。"""
-    labels = {sid: f"leg{(sid - 1) // 3 + 1}" for sid in SERVO_IDS}
-    try:
-        with CONFIG_PATH.open("r", encoding="utf-8") as fh:
-            mapping = json.load(fh).get("leg_position_mapping", {})
-    except (OSError, ValueError):
-        mapping = {}
-    roles = ("hip", "femur", "tibia")
-    for leg, name in mapping.items():
-        try:
-            base = (int(leg) - 1) * 3
-        except ValueError:
-            continue
-        for offset, role in enumerate(roles):
-            labels[base + offset + 1] = f"{name}.{role}"
-    return labels
 
 
 # ---------------------------------------------------------------- 交互命令
@@ -273,6 +293,7 @@ def monitor_servos(ser: serial.Serial, ids: list[int], interval: float = 0.1):
 def cmd_pose(ser: serial.Serial, name: str, pose: dict, time_ms: int):
     servos = load_pose(pose)
     print(f"{name}姿态: " + " ".join(f"{sid}:{pos}" for sid, pos in servos))
+    load_servos(ser, [servo_id for servo_id, _ in servos])
     send_move(ser, servos, time_ms)
     print(f"已发送移动指令（{len(servos)} 个舵机，{time_ms}ms 内到位）")
     wait = max(0.2, time_ms / 1000 + 0.5)
@@ -300,6 +321,112 @@ def _direction_label(vx: float, vy: float) -> str:
     labels = ("前进", "左前方", "左移", "左后方",
               "后退", "右后方", "右移", "右前方")
     return labels[round(angle / 45.0) % 8]
+
+
+# ---------------------------------------------------------------- 步态循环
+
+def _smoothstep(t: float) -> float:
+    """平滑阶跃：t 在 [0, 1] 上从 0 平滑过渡到 1，两端一阶导为 0。"""
+    t = min(1.0, max(0.0, t))
+    return t * t * (3.0 - 2.0 * t)
+
+
+def _hold_stand(ser: serial.Serial, stand_pose: dict[int, float],
+                reason: str):
+    """发送自然站立姿态并短暂等待（速度/步幅为 0 等不启动步态的情况）。"""
+    load_servos(ser, SERVO_IDS)
+    send_move(ser, quantize_pose(stand_pose), WALK_STAND_MOVE_TIME_MS)
+    print(reason)
+    try:
+        time.sleep(1.0)
+    except KeyboardInterrupt:
+        print()
+
+
+def _wait_stand_complete(should_stop: Callable[[], bool] | None,
+                         wait_s: float, name: str) -> bool:
+    """等待站立到位，期间响应停止信号或 Ctrl+C；返回 False 表示应中止步态。"""
+    try:
+        deadline = time.monotonic() + wait_s
+        while time.monotonic() < deadline:
+            if should_stop is not None and should_stop():
+                print(f"\n{name}启动被取消，保持自然站立姿态。")
+                return False
+            time.sleep(0.02)
+    except KeyboardInterrupt:
+        print(f"{name}启动被中断，保持自然站立姿态。")
+        return False
+    return True
+
+
+def _run_gait_loop(ser: serial.Serial, pose_fn: Callable[..., dict[int, float]],
+                   target_amps: tuple[float, ...],
+                   stand_pose: dict[int, float],
+                   cycle_s: float, ramp_s: float, name: str,
+                   should_stop: Callable[[], bool] | None):
+    """运行步态帧循环并负责安全停止，供平移与旋转两类步态共用。
+
+    pose_fn(phase, *amps) 返回当前幅值下的 18 个舵机位置；target_amps 是
+    爬升结束后的目标幅值（平移为 (x 步幅, y 步幅)，旋转为 (单周期转角,)）。
+    启动后幅值在 ramp_s（约 1.5 个周期）内从 0 平滑爬升；收到停止信号后
+    不立即回中，而是走完当前半步、把幅值平滑降到 0，等当前摆动组落地后
+    停在自然站立姿态，避免中断步态造成的“往回拉”。任何退出路径（Ctrl+C、
+    IK 越界、异常）都会回到自然站立姿态。
+    """
+    start = time.monotonic()
+    stopping = False
+    stop_phase = 0.0
+    amps_at_stop = target_amps
+    finish_span = 0.5
+    try:
+        while True:
+            frame_start = time.monotonic()
+            elapsed = frame_start - start
+            phase = (elapsed / cycle_s) % 1.0
+
+            if stopping:
+                # 幅值按平滑阶跃从停止点衰减到 0
+                progress = ((phase - stop_phase) % 1.0) / finish_span
+                amps = tuple(a * (1.0 - _smoothstep(progress))
+                             for a in amps_at_stop)
+            elif should_stop is not None and should_stop():
+                print("\n收到停止信号，走完当前一步后停下。")
+                stopping = True
+                stop_phase = phase
+                amps_at_stop = tuple(a * _smoothstep(elapsed / ramp_s)
+                                     for a in target_amps)
+                # 目标为下一个半步边界（0.5 相位），即当前摆动组落地瞬间
+                finish_span = math.ceil(phase * 2.0) / 2.0 - phase
+                if finish_span < 0.05:
+                    finish_span += 0.5
+                amps = amps_at_stop
+            else:
+                # 幅值在约 1.5 个周期内从 0 平滑爬升到目标值
+                amps = tuple(a * _smoothstep(elapsed / ramp_s)
+                             for a in target_amps)
+
+            pose = pose_fn(phase, *amps)
+
+            if stopping and ((phase - stop_phase) % 1.0) >= finish_span:
+                # 幅值已降到 0，摆动组已落地：当前姿态就是自然站立，
+                # 直接交给 finally 稳住即可
+                break
+            send_move(ser, quantize_pose(pose), WALK_MOVE_TIME_MS)
+
+            delay = frame_start + WALK_FRAME_PERIOD - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+    except KeyboardInterrupt:
+        print()
+    except UnreachableFootError as exc:
+        print(f"\n目标轨迹超出腿部工作空间，{name}提前停止: {exc}")
+    finally:
+        send_move(ser, quantize_pose(stand_pose), WALK_STAND_MOVE_TIME_MS)
+        print(f"{name}已停止，已回到自然站立姿态。")
+        try:
+            time.sleep(WALK_STAND_MOVE_TIME_MS / 1000 + 0.1)
+        except KeyboardInterrupt:
+            print()
 
 
 def cmd_move(ser: serial.Serial, vx_mm_s: float, vy_mm_s: float,
@@ -342,12 +469,7 @@ def cmd_move(ser: serial.Serial, vx_mm_s: float, vy_mm_s: float,
     stand_pose = GAIT.stand_pose()
 
     if speed < 1e-9 or stride <= 0:
-        send_move(ser, quantize_pose(stand_pose), WALK_STAND_MOVE_TIME_MS)
-        print("速度为 0 或步幅非正，已发送自然站立姿态。")
-        try:
-            time.sleep(1.0)
-        except KeyboardInterrupt:
-            print()
+        _hold_stand(ser, stand_pose, "速度为 0 或步幅非正，已发送自然站立姿态。")
         return
 
     # 合速度方向的单位向量：把总步幅按方向分解到身体 x/y 两个轴。
@@ -364,81 +486,15 @@ def cmd_move(ser: serial.Serial, vx_mm_s: float, vy_mm_s: float,
 
     if stand_first:
         # 先站到自然姿态，再进入步态循环
+        load_servos(ser, SERVO_IDS)
         send_move(ser, quantize_pose(stand_pose), WALK_STAND_MOVE_TIME_MS)
-        wait_s = WALK_STAND_MOVE_TIME_MS / 1000 + 0.1
-        try:
-            deadline = time.monotonic() + wait_s
-            while time.monotonic() < deadline:
-                if should_stop is not None and should_stop():
-                    print("\n步态启动被取消，保持自然站立姿态。")
-                    return
-                time.sleep(0.02)
-        except KeyboardInterrupt:
-            print("步态启动被中断，保持自然站立姿态。")
+        if not _wait_stand_complete(should_stop,
+                                    WALK_STAND_MOVE_TIME_MS / 1000 + 0.1,
+                                    "步态"):
             return
 
-    start = time.monotonic()
-    # 停止阶段状态：收到停止信号后不立即回中，而是走完当前半步，
-    # 同时把两个轴向的步幅平滑降到 0；到达半步边界时当前摆动组正好
-    # 落地，全足着地且处于自然站立姿态，避免中断步态造成的“往回拉”。
-    stopping = False
-    stop_phase = 0.0
-    stride_x_at_stop = 0.0
-    stride_y_at_stop = 0.0
-    finish_span = 0.5
-    try:
-        while True:
-            frame_start = time.monotonic()
-            elapsed = frame_start - start
-            phase = (elapsed / cycle_s) % 1.0
-
-            if stopping:
-                progress = ((phase - stop_phase) % 1.0) / finish_span
-                t = min(1.0, progress)
-                decel = 1.0 - (t * t * (3.0 - 2.0 * t))
-                stride_x_now = stride_x_at_stop * decel
-                stride_y_now = stride_y_at_stop * decel
-            elif should_stop is not None and should_stop():
-                print("\n收到停止信号，走完当前一步后停下。")
-                stopping = True
-                stop_phase = phase
-                ramp_progress = min(1.0, elapsed / ramp_s)
-                smooth = ramp_progress * ramp_progress * (3 - 2 * ramp_progress)
-                stride_x_at_stop = stride_target_x * smooth
-                stride_y_at_stop = stride_target_y * smooth
-                # 目标为下一个半步边界（0.5 相位），即当前摆动组落地瞬间
-                finish_span = math.ceil(phase * 2.0) / 2.0 - phase
-                if finish_span < 0.05:
-                    finish_span += 0.5
-                stride_x_now = stride_x_at_stop
-                stride_y_now = stride_y_at_stop
-            else:
-                # 约 1.5 个周期内把步幅从 0 平滑爬升到目标值
-                ramp_progress = min(1.0, elapsed / ramp_s)
-                smooth = ramp_progress * ramp_progress * (3 - 2 * ramp_progress)
-                stride_x_now = stride_target_x * smooth
-                stride_y_now = stride_target_y * smooth
-
-            pose = GAIT.pose_at(phase, stride_x_now, stride_y_now)
-
-            if stopping and ((phase - stop_phase) % 1.0) >= finish_span:
-                # 步幅已降到 0，摆动组已落地：当前姿态就是自然站立，
-                # 直接交给 finally 稳住即可
-                break
-            send_move(ser, quantize_pose(pose), WALK_MOVE_TIME_MS)
-
-            delay = frame_start + WALK_FRAME_PERIOD - time.monotonic()
-            if delay > 0:
-                time.sleep(delay)
-    except KeyboardInterrupt:
-        print()
-    finally:
-        send_move(ser, quantize_pose(stand_pose), WALK_STAND_MOVE_TIME_MS)
-        print("步态已停止，已回到自然站立姿态。")
-        try:
-            time.sleep(WALK_STAND_MOVE_TIME_MS / 1000 + 0.1)
-        except KeyboardInterrupt:
-            print()
+    _run_gait_loop(ser, GAIT.pose_at, (stride_target_x, stride_target_y),
+                   stand_pose, cycle_s, ramp_s, "步态", should_stop)
 
 
 def cmd_gait(ser: serial.Serial, speed_mm_s: float,
@@ -486,8 +542,8 @@ def cmd_turn(ser: serial.Serial, speed_deg_s: float,
 
     speed_deg_s 为正值时俯视逆时针（左转）、负值时顺时针（右转），
     范围钳制到 ±TURN_SPEED_LIMIT；step_deg 是每个完整步态周期身体旋转的
-    角度，默认取 TURN_STEP_DEFAULT，不做钳制，超出腿部工作空间时由 IK 抛
-    UnreachableFootError。
+    角度，默认取 TURN_STEP_DEFAULT，不做钳制；超出腿部工作空间时打印提示
+    并安全回到自然站立姿态。
     周期 T = 2*step/speed：支撑相内身体旋转 step、足端相对身体反向旋转
     step，保证足端在地面不打滑。启动时先发送自然站立姿态，随后转角在
     约 1.5 个周期内从 0 平滑爬升。should_stop 为可选回调，每个步态帧
@@ -515,12 +571,8 @@ def cmd_turn(ser: serial.Serial, speed_deg_s: float,
     stand_pose = GAIT.stand_pose()
 
     if abs(speed) < 1e-9 or step <= 0:
-        send_move(ser, quantize_pose(stand_pose), WALK_STAND_MOVE_TIME_MS)
-        print("旋转速度为 0 或单周期转角非正，已发送自然站立姿态。")
-        try:
-            time.sleep(1.0)
-        except KeyboardInterrupt:
-            print()
+        _hold_stand(ser, stand_pose,
+                    "旋转速度为 0 或单周期转角非正，已发送自然站立姿态。")
         return
 
     direction = "左转（俯视逆时针）" if speed > 0 else "右转（俯视顺时针）"
@@ -534,73 +586,18 @@ def cmd_turn(ser: serial.Serial, speed_deg_s: float,
 
     if stand_first:
         # 先站到自然姿态，再进入旋转步态循环
+        load_servos(ser, SERVO_IDS)
         send_move(ser, quantize_pose(stand_pose), WALK_STAND_MOVE_TIME_MS)
-        wait_s = WALK_STAND_MOVE_TIME_MS / 1000 + 0.1
-        try:
-            deadline = time.monotonic() + wait_s
-            while time.monotonic() < deadline:
-                if should_stop is not None and should_stop():
-                    print("\n旋转启动被取消，保持自然站立姿态。")
-                    return
-                time.sleep(0.02)
-        except KeyboardInterrupt:
-            print("旋转启动被中断，保持自然站立姿态。")
+        if not _wait_stand_complete(should_stop,
+                                    WALK_STAND_MOVE_TIME_MS / 1000 + 0.1,
+                                    "旋转"):
             return
 
     step_target = math.copysign(step, speed)
-    start = time.monotonic()
-    # 停止阶段状态：收到停止信号后走完当前半步，转角平滑降到 0，
-    # 到达半步边界时当前摆动组正好落地，全足着地且处于自然站立姿态。
-    stopping = False
-    stop_phase = 0.0
-    step_at_stop = 0.0
-    finish_span = 0.5
-    try:
-        while True:
-            frame_start = time.monotonic()
-            elapsed = frame_start - start
-            phase = (elapsed / cycle_s) % 1.0
-
-            if stopping:
-                progress = ((phase - stop_phase) % 1.0) / finish_span
-                t = min(1.0, progress)
-                decel = 1.0 - (t * t * (3.0 - 2.0 * t))
-                step_now = step_at_stop * decel
-            elif should_stop is not None and should_stop():
-                print("\n收到停止信号，走完当前一步后停下。")
-                stopping = True
-                stop_phase = phase
-                ramp_progress = min(1.0, elapsed / ramp_s)
-                smooth = ramp_progress * ramp_progress * (3 - 2 * ramp_progress)
-                step_at_stop = step_target * smooth
-                finish_span = math.ceil(phase * 2.0) / 2.0 - phase
-                if finish_span < 0.05:
-                    finish_span += 0.5
-                step_now = step_at_stop
-            else:
-                # 约 1.5 个周期内把单周期转角从 0 平滑爬升到目标值
-                ramp_progress = min(1.0, elapsed / ramp_s)
-                smooth = ramp_progress * ramp_progress * (3 - 2 * ramp_progress)
-                step_now = step_target * smooth
-
-            pose = GAIT.turn_pose_at(phase, math.radians(step_now))
-
-            if stopping and ((phase - stop_phase) % 1.0) >= finish_span:
-                break
-            send_move(ser, quantize_pose(pose), WALK_MOVE_TIME_MS)
-
-            delay = frame_start + WALK_FRAME_PERIOD - time.monotonic()
-            if delay > 0:
-                time.sleep(delay)
-    except KeyboardInterrupt:
-        print()
-    finally:
-        send_move(ser, quantize_pose(stand_pose), WALK_STAND_MOVE_TIME_MS)
-        print("旋转已停止，已回到自然站立姿态。")
-        try:
-            time.sleep(WALK_STAND_MOVE_TIME_MS / 1000 + 0.1)
-        except KeyboardInterrupt:
-            print()
+    _run_gait_loop(ser,
+                   lambda phase, s: GAIT.turn_pose_at(phase, math.radians(s)),
+                   (step_target,), stand_pose, cycle_s, ramp_s, "旋转",
+                   should_stop)
 
 
 def print_help():
@@ -736,7 +733,8 @@ def run_repl(ser: serial.Serial, move_time_ms: int):
 def main():
     parser = argparse.ArgumentParser(description="Spiderbot 六足机器人舵机驱动程序")
     parser.add_argument("--port", default=PORT, help=f"串口设备 (默认 {PORT})")
-    parser.add_argument("--baud", type=int, default=BAUD, help="波特率 (默认 9600)")
+    parser.add_argument("--baud", type=int, default=BAUD,
+                        help=f"波特率 (默认 {BAUD})")
     parser.add_argument("--time", type=int, default=1500,
                         help="站立/展平的舵机移动时间毫秒数 (默认 1500)")
     args = parser.parse_args()
@@ -747,23 +745,19 @@ def main():
         parser.error("--baud 必须大于 0")
 
     try:
-        ser = serial.Serial(port=args.port, baudrate=args.baud, bytesize=8,
-                            parity="N", stopbits=1, timeout=0.2, write_timeout=1)
+        ser = open_serial(args.port, args.baud)
     except serial.SerialException as exc:
         print(f"无法打开串口 {args.port}: {exc}")
-        print("请检查控制板是否连接，或使用 --port 指定正确设备。")
+        print("请检查 USB 总线模块是否连接，或使用 --port 指定正确设备。")
         sys.exit(1)
 
-    ser.dtr = False
-    ser.rts = False
-    time.sleep(0.1)
     try:
         run_repl(ser, args.time)
     finally:
         try:
             # 退出前自动失能全部舵机，避免机器人保持僵硬的最后姿态
             unload_servos(ser, SERVO_IDS)
-            time.sleep(0.1)  # 等待控制板处理完卸载帧
+            time.sleep(0.1)  # 等待总线模块发送完卸载帧
             print("程序退出，18 个舵机已自动失能。")
         except OSError as exc:
             print(f"程序退出时自动失能失败: {exc}")

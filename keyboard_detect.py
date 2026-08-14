@@ -77,16 +77,10 @@ def main():
     args = parser.parse_args()
 
     try:
-        ser = serial.Serial(port=args.port, baudrate=args.baud, bytesize=8,
-                            parity="N", stopbits=1, timeout=0.2,
-                            write_timeout=1)
+        ser = servo_driver.open_serial(args.port, args.baud)
     except serial.SerialException as exc:
         print(f"无法打开串口 {args.port}: {exc}")
         sys.exit(1)
-
-    ser.dtr = False
-    ser.rts = False
-    time.sleep(0.1)
 
     # 当前步态线程、它的停止信号、以及它对应的方向按键组合
     gait_thread: threading.Thread | None = None

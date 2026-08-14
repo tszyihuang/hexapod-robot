@@ -63,7 +63,7 @@ from pathlib import Path
 
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().with_name("physical_config.json")
 
-# 舵机实际有效量程 0-1000（对应 0-240°），控制板标称 10 位量程 0-1023；
+# 舵机实际有效量程 0-1000（对应 0-240°），舵机标称 10 位量程 0-1023；
 # 这里统一按有效量程收进 1000，避免生成硬件无法正确执行或可能被钳制的位置。
 SERVO_POS_MAX = 1000
 
@@ -179,7 +179,8 @@ class HexapodIK:
         """舵机位置 -> (theta, phi, kappa)，角度为弧度。
 
         换算规则与 physical_config.json 的 position_to_angle_formula 一致：
-        512 对应左腿 theta=+45° / 右腿 theta=-45°，phi=0°，kappa=+45°。
+        512 对应 theta=该腿髋舵机安装朝向（hip_anchor_direction_deg，前腿
+        ±45°、中腿 ±90°、后腿 ±135°）、phi=0°、kappa=+45°。
         """
         hip, femur, tibia = self._resolve_leg_positions(leg_id, positions)
         scale = self.scale

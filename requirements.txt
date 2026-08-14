@@ -1,0 +1,5 @@
+# 串口通信（LX-15D/LX-16A 总线舵机直连，115200 8N1）
+pyserial>=3.5
+
+# 键盘实时控制（keyboard_detect.py；Linux 下需要 root 权限运行）
+keyboard>=0.13
