@@ -28,6 +28,7 @@
 """
 
 import argparse
+import gc
 import math
 import sys
 import time
@@ -60,6 +61,12 @@ WALK_STAND_MOVE_TIME_MS = 100  # 启动/停止时回到自然站立的移动时�
 # 每帧末尾提前醒来、用忙等补齐剩余时间的余量；把 20ms 帧间隔抖动压到
 # 毫秒级以内，而不是依赖 time.sleep 的调度粒度。
 WALK_SCHEDULE_AHEAD_S = 0.0015
+
+# 每帧舵机移动时间必须与帧周期一致：舵机恰好在一个周期内到达目标，
+# 下一帧的新目标才能连续衔接（位置流式下发）。修改帧周期时务必同步改两者。
+assert WALK_MOVE_TIME_MS == round(WALK_FRAME_PERIOD * 1000), (
+    "WALK_MOVE_TIME_MS 必须等于 WALK_FRAME_PERIOD 的毫秒数"
+)
 
 # ---------------------------------------------------------------- 内置数据
 
@@ -289,15 +296,31 @@ def _run_gait_loop(ser: serial.Serial, pose_fn: Callable[..., dict[int, float]],
 
     指令按固定帧周期 WALK_FRAME_PERIOD（默认 50Hz）下达：每帧末尾先
     sleep 到临近截止时间，再用忙等补齐，避免调度粒度造成帧间隔抖动。
+    循环期间禁用 GC、进入前排空 RX 残留字节，并统计滑帧（帧间隔超过
+    125% 帧周期记一次），结束时不依赖滑帧与否都会打印帧间隔统计。
     """
     start = time.monotonic()
     stopping = False
     stop_phase = 0.0
     amps_at_stop = target_amps
     finish_span = 0.5
+    # 滑帧统计：帧间隔超过 125% 帧周期记为一次滑帧（默认阈值 25ms）
+    slip_limit_s = WALK_FRAME_PERIOD * 1.25
+    frame_slips = 0
+    max_gap_s = 0.0
+    prev_frame_start = start
+    gc.disable()  # 步态对帧周期敏感，禁用 GC 避免偶发停顿造成滑帧
     try:
+        # 清掉此前 read/monitor 等命令残留的应答字节，保持热路径 RX 干净
+        ser.reset_input_buffer()
         while True:
             frame_start = time.monotonic()
+            gap = frame_start - prev_frame_start
+            prev_frame_start = frame_start
+            if gap > slip_limit_s:
+                frame_slips += 1
+                if gap > max_gap_s:
+                    max_gap_s = gap
             elapsed = frame_start - start
             phase = (elapsed / cycle_s) % 1.0
 
@@ -342,8 +365,11 @@ def _run_gait_loop(ser: serial.Serial, pose_fn: Callable[..., dict[int, float]],
     except UnreachableFootError as exc:
         print(f"\n目标轨迹超出腿部工作空间，{name}提前停止: {exc}")
     finally:
+        gc.enable()  # 无论何种退出路径，先恢复 GC
         send_move(ser, quantize_pose(stand_pose), WALK_STAND_MOVE_TIME_MS)
         print(f"{name}已停止，已回到自然站立姿态。")
+        print(f"帧间隔统计：滑帧 {frame_slips} 次，最大间隔 {max_gap_s*1000:.1f} ms"
+              f"（阈值 {slip_limit_s*1000:.1f} ms）")
         try:
             time.sleep(WALK_STAND_MOVE_TIME_MS / 1000 + 0.1)
         except KeyboardInterrupt:
