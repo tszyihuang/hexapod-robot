@@ -10,7 +10,7 @@
 
 用法：
   python3 servo_monitor.py [--port /dev/ttyUSB0] [--baud 115200]
-                           [--interval 0.1] [--ids 1-18]
+                           [--interval 0] [--ids 1-18]
 
 --ids 支持逗号分隔或区间，例如 1-18、13,14,15、1-6,13-18。
 """
@@ -74,8 +74,8 @@ def main():
     parser.add_argument("--port", default=PORT, help=f"串口设备 (默认 {PORT})")
     parser.add_argument("--baud", type=int, default=BAUD,
                         help=f"波特率 (默认 {BAUD})")
-    parser.add_argument("--interval", type=float, default=0.1,
-                        help="刷新间隔秒 (默认 0.1)")
+    parser.add_argument("--interval", type=float, default=0.0,
+                        help="刷新间隔秒，0 为最快 (默认 0)")
     parser.add_argument("--ids", type=parse_ids, default=DEFAULT_IDS,
                         help=f"要监视的舵机 ID (默认 {DEFAULT_IDS})")
     args = parser.parse_args()
@@ -103,6 +103,9 @@ def main():
         print("未发现在线舵机，将每 2 秒重新扫描一次。")
 
     offline_count = 0
+    # 刷新率统计：EMA 平滑实际打印间隔，避免逐帧抖动
+    ema_cycle = None
+    last_t = None
     try:
         while True:
             if not online:
@@ -110,6 +113,8 @@ def main():
                 online = discover(ser, args.ids)
                 if online:
                     print(f"\r\x1b[2K发现在线舵机: {online}", flush=True)
+                last_t = None  # 重新计时，避免空档拉低 EMA
+                ema_cycle = None
                 continue
 
             positions: dict[int, int] = {}
@@ -127,7 +132,14 @@ def main():
                 f"{sid}:{positions[sid]}" if sid in positions else f"{sid}:-"
                 for sid in online
             ]
-            line = f"[{time.strftime('%H:%M:%S')}] " + " ".join(parts)
+            now = time.time()
+            if last_t is not None:
+                dt = now - last_t
+                ema_cycle = dt if ema_cycle is None else 0.8 * ema_cycle + 0.2 * dt
+            last_t = now
+            hz = 1.0 / ema_cycle if ema_cycle else 0.0
+            line = (f"[{time.strftime('%H:%M:%S')}] {hz:4.1f}Hz  "
+                    + " ".join(parts))
             print(f"\r\x1b[2K{line}", end="", flush=True)
 
             # 连续多次完全无应答时重新扫描，自动适应总线上的舵机变化
@@ -135,6 +147,8 @@ def main():
                 print("\r\x1b[2K舵机全部失联，重新扫描在线舵机...", flush=True)
                 online = discover(ser, args.ids)
                 offline_count = 0
+                last_t = None
+                ema_cycle = None
 
             if args.interval > 0:
                 time.sleep(args.interval)

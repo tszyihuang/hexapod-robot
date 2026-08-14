@@ -67,6 +67,11 @@ def send_command(ser: serial.Serial, servo_id: int, cmd: int,
 
     只返回 ID 与指令都匹配、且校验和合法的完整应答帧；写指令（移动、
     加载/卸载）通常无应答，应使用 write_commands。
+
+    用 ser.read(1) 精确等待首个应答字节，而非 ser.read(4096)：pyserial 的
+    read(size) 在有超时时会一直等到凑满 size 字节或超时才返回，读 4096
+    字节会白白阻塞整个 timeout_s（20ms），把 18 舵机扫描拖到约 2.7Hz。
+    read(1) 由内核 select 唤醒，没有 sleep 轮询的粒度损失。
     """
     old_timeout = ser.timeout
     ser.timeout = timeout_s
@@ -77,12 +82,14 @@ def send_command(ser: serial.Serial, servo_id: int, cmd: int,
         data = b""
         deadline = time.time() + wait_s
         while time.time() < deadline:
-            chunk = ser.read(4096)
-            if chunk:
-                data += chunk
-                for frame in iter_frames(data):
-                    if frame[2] == servo_id and frame[4] == cmd:
-                        return frame
+            # 精确阻塞到首个应答字节或 timeout_s；随后读走当前已到的其余字节
+            first = ser.read(1)
+            if not first:
+                continue  # read(1) 超时，尚未等到数据
+            data += first + ser.read(ser.in_waiting)
+            for frame in iter_frames(data):
+                if frame[2] == servo_id and frame[4] == cmd:
+                    return frame
         return None
     finally:
         ser.timeout = old_timeout
