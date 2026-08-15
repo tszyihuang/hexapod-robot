@@ -1,8 +1,51 @@
 # Spiderbot 六足机器人控制程序
 
-基于 Hiwonder LX-15D × 18 串行总线舵机（USB 转总线模块直连，串口
-115200 8N1）的六足机器人运动学与步态控制程序，支持交互控制台与键盘
-实时控制。
+> 基于 Hiwonder LX-15D 串行总线舵机的六足机器人运动学与步态控制程序。
+> 机体为亚博（Yahboom）Spiderbot 六足原型机，从物理配置到逆运动学、
+> 三角步态、串口驱动，再到键盘遥控，一套纯 Python 实现。
+>
+> *A Python hexapod robot control stack: kinematics, tripod gait, serial-bus
+> servo driver and keyboard teleoperation — config-driven, zero hardcoded magic
+> numbers.*
+
+## 项目简介
+
+本项目为亚博（Yahboom）Spiderbot 六足原型机（18 舵机，6 腿 × 3 关节）
+提供完整的底层控制软件：以 `physical_config.json` 为唯一物理参数来源，通过解析
+逆运动学求解每条腿的舵机角度，生成三角步态（tripod gait）足端轨迹，
+经 USB 转总线模块以 115200 8N1 串口实时驱动 Hiwonder LX-15D 舵机。
+
+支持三种控制方式：
+
+- **交互控制台（REPL）**：站立、展平、行走、横移、原地旋转、卸力；
+- **键盘实时遥控**：W/S/A/D 平移、Q/E 旋转、斜向组合，松开即停；
+- **只读监视器**：舵机位置持续监视与 IMU 姿态数据实时显示。
+
+## 特性
+
+- 🕷️ **纯 Python 运动学**：正/逆运动学与步态生成完全独立于硬件 I/O，
+  可在无机器人环境下离线测试（`kinematics.py` 仅依赖标准库）；
+- 📐 **配置驱动**：腿几何、舵机映射、关节限位、角度约定、安装坐标全部
+  来自 `physical_config.json`，改硬件参数无需改代码；
+- 🦵 **三角步态**：支撑相/摆动相相位差 0.5，支撑相足端相对身体等速后退
+  保证不打滑，支持任意水平速度向量合成（平移 + 横移 + 旋转）；
+- 🔌 **串行总线舵机协议**：LX-15D/LX-16A 帧的构造、校验与解析，
+  含超时与应答匹配、失联自动重扫；
+- 🎮 **实时键盘控制**：全局按键监听，多键斜向组合，松开自动回自然站立；
+- 📡 **IMU 监视**：亚博（Yahboom）IMU-Sensor 九轴数据的只读解析与
+  覆盖式实时显示（欧拉角 / 四元数 / 加速度 / 角速度 / 磁场）；
+- 🤖 **URDF 模型**：由配置自动生成的机器人模型，可直接用于 RViz /
+  PyBullet 等工具做可视化与仿真。
+
+## 硬件清单
+
+| 部件 | 规格 |
+| --- | --- |
+| 机体 | 亚博（Yahboom）Spiderbot 六足原型机（6 腿 × 3 关节） |
+| 舵机 | Hiwonder LX-15D × 18，串行总线舵机 |
+| 通信 | USB 转总线模块直连，串口 115200 8N1 |
+| 主机 | Linux（Python 3.10+），需串口权限 |
+| 传感器（可选） | 亚博 Yahboom IMU-Sensor（CH340 USB 串口） |
 
 ## 文件结构
 
@@ -12,6 +55,8 @@
 | `servo_driver.py` | 串口协议 + 只读位置监视 + 步态控制循环 + 交互控制台（REPL）。原 `servo_protocol.py` / `servo_monitor.py` 已合并到本文件 |
 | `keyboard_detect.py` | 键盘实时控制（W/S/A/D 平移、Q/E 旋转、斜向组合，松开即停） |
 | `physical_config.json` | **唯一的物理参数来源**：腿几何、舵机映射、关节限位、角度约定、安装坐标 |
+| `hexapod.urdf` | 机器人 URDF 模型（由配置自动生成，勿手改） |
+| `imu_monitor.py` | 亚博 IMU 姿态传感器监视器（只读，覆盖式打印） |
 
 依赖方向单向：`keyboard_detect` → `servo_driver` → `kinematics`；
 `kinematics` 只依赖 Python 标准库。
@@ -69,10 +114,20 @@ sudo python3 keyboard_detect.py [--port ...] [--speed ...] [--turn-speed ...]
 W/S/A/D 前后左右，Q/E 逆/顺时针旋转；W+A、W+D、S+A、S+D 斜向组合
 （斜向分量自动取 √2/2，合速度与单方向一致）；松开即停，ESC 退出。
 
+### IMU 监视器
+
+```bash
+python3 imu_monitor.py [--port /dev/ttyUSB1] [--baud 115200] [--interval 0] [--plain]
+```
+
+未指定 `--port` 时自动探测 `/dev/ttyUSB*`、`/dev/ttyACM*` 与
+`/dev/serial/by-id/*`。只读运行，不影响机器人与 IMU。
+
 ## 物理参数
 
 所有几何与舵机参数以 `physical_config.json` 为准，代码不另设硬编码副本。
-修改配置（如腿长度、安装点、关节限位）后无需改代码即可生效。
+修改配置（如腿长度、安装点、关节限位）后无需改代码即可生效；
+`hexapod.urdf` 需重新生成（见文件头部注释）。
 `kinematics.py` 模块 docstring 包含坐标系、角度符号与步态相位约定的完整说明。
 
 ## 串口协议
@@ -86,3 +141,7 @@ USB 总线模块直连舵机，帧格式
 - `0x0E` 舵机 ID 查询
 - `0x1C` 舵机位置读取
 - `0x1F` 舵机加载/卸载（扭矩开关）
+
+## 许可
+
+暂无 License 文件；如需引用或复用代码，请先联系作者。
