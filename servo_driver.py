@@ -1,30 +1,18 @@
 #!/usr/bin/env python3
-"""Spiderbot 六足机器人舵机驱动程序（统一交互控制台）。
+"""Spiderbot 六足机器人串行总线舵机控制程序。
 
-把「读取位置」「站立」「展平」「步态行走/横移」等功能整合到一个程序里。
-启动后在控制台输入命令：
+本文件已把原先的 servo_protocol.py、servo_monitor.py、servo_driver.py
+合并为一个模块，包含三层内容：
 
-  read     持续读取 1-18 号舵机位置并覆盖打印，无响应自动重试（Ctrl+C 停止）
-  stand    让机器人站立（内置站立姿态）
-  flatten  让机器人展平（内置展平姿态）
-  walk     以三角步态行走，可选速度 mm/s 与步幅 mm（默认 350 / 100，正数前进、负数后退）
-  strafe   以三角步态横向移动，可选速度 mm/s 与步幅 mm（默认 350 / 100，正数左移、负数右移）
-  move     以身体坐标系速度向量平移，可选 vx vy（mm/s，默认 350 0；vx 前正、vy 左正）
-  turn     原地旋转，可选角速度 deg/s 与单周期转角 deg（默认 80 / 20，正数左转、负数右转）
-  relax    卸载所有舵机（失能，可手动转动）
-  help     显示本帮助
-  quit     退出程序（退出前自动失能全部舵机）
+1. 协议层：LX-15D/LX-16A 串行总线舵机帧构造/解析与串口收发；
+2. 监视层：只读持续显示舵机位置、扫描在线 ID、失联自动重扫；
+3. 控制层：交互控制台 + 步态循环（站立/展平/行走/横移/旋转）。
 
-站立/展平移动完成后舵机会保持通电并维持姿态；如果想让舵机失能、
-方便手动摆位，输入 relax。
+默认运行交互控制台；加 --monitor 运行只读监视器。本模块仍导出
+PORT、BAUD、open_serial、cmd_walk 等接口，供 keyboard_detect.py 导入。
 
-协议（LX-15D/LX-16A 串行总线舵机，USB 转总线模块直连，115200 8N1）：
-  帧格式 0x55 0x55 | ID | 长度 | 指令 | 参数 | 校验和
-  长度 = 参数个数 + 3；校验和 = ~(ID + 长度 + 指令 + 参数之和) 低 8 位
-  0x01 = 单舵机移动（含时间）
-  0x0E = 舵机 ID 查询
-  0x1C = 舵机位置读取
-  0x1F = 舵机加载/卸载（扭矩开关）
+协议：帧格式 0x55 0x55 | ID | 长度 | 指令 | 参数 | 校验和。
+长度 = 参数个数 + 3；校验和 = ~(ID + 长度 + 指令 + 参数之和) 低 8 位。
 """
 
 import argparse
@@ -37,102 +25,213 @@ from collections.abc import Callable
 import serial
 
 from kinematics import HexapodIK, TripodGait, UnreachableFootError
-from servo_protocol import (BAUD, CMD_SERVO_LOAD_OR_UNLOAD_WRITE,
-                            CMD_SERVO_MOVE_TIME_WRITE, CMD_SERVO_POS_READ,
-                            PORT, drain_until_quiet, open_serial,
-                            send_command, write_commands)
+
+# ---------------------------------------------------------------- 协议常量
+
+PORT = "/dev/ttyUSB0"
+BAUD = 115200
+
+CMD_SERVO_MOVE_TIME_WRITE = 0x01
+CMD_SERVO_ID_READ = 0x0E
+CMD_SERVO_POS_READ = 0x1C
+CMD_SERVO_LOAD_OR_UNLOAD_WRITE = 0x1F
+
+# ---------------------------------------------------------------- 协议层
+
+
+def build_frame(servo_id: int, cmd: int,
+                params: tuple[int, ...] = ()) -> bytes:
+    """构造协议帧：0x55 0x55 | ID | 长度 | 指令 | 参数 | 校验和。"""
+    length = len(params) + 3
+    frame = bytearray([0x55, 0x55, servo_id, length, cmd])
+    frame += bytes(params)
+    frame.append((~sum(frame[2:])) & 0xFF)
+    return bytes(frame)
+
+
+def iter_frames(data: bytes):
+    """从数据流中切出校验和合法的完整应答帧。"""
+    i, n = 0, len(data)
+    while i + 6 <= n:
+        if data[i:i + 2] != b"\x55\x55":
+            i += 1
+            continue
+        length = data[i + 3]
+        total = length + 3
+        if length < 3 or i + total > n:
+            i += 1
+            continue
+        frame = data[i:i + total]
+        if (~sum(frame[2:-1]) & 0xFF) == frame[-1]:
+            yield frame
+        i += 1
+
+
+def open_serial(port: str, baud: int) -> serial.Serial:
+    """打开串口（8N1），关闭 DTR/RTS 并等待 USB 总线模块稳定。"""
+    ser = serial.Serial(port=port, baudrate=baud, bytesize=8, parity="N",
+                        stopbits=1, timeout=0.2, write_timeout=1)
+    ser.dtr = False
+    ser.rts = False
+    time.sleep(0.1)
+    return ser
+
+
+def send_command(ser: serial.Serial, servo_id: int, cmd: int,
+                 params: tuple[int, ...] = (), wait_s: float = 0.08,
+                 timeout_s: float = 0.02) -> bytes | None:
+    """发送指令并等待 ID/指令都匹配的合法应答，超时返回 None。
+
+    使用 ser.read(1) 精确等待首个应答字节，避免 pyserial read(4096)
+    在超时模式下为了凑满字节而阻塞整个 timeout_s。
+    """
+    old_timeout = ser.timeout
+    ser.timeout = timeout_s
+    try:
+        ser.reset_input_buffer()
+        ser.write(build_frame(servo_id, cmd, params))
+        ser.flush()
+        data = b""
+        deadline = time.time() + wait_s
+        while time.time() < deadline:
+            first = ser.read(1)
+            if not first:
+                continue
+            data += first + ser.read(ser.in_waiting)
+            for frame in iter_frames(data):
+                if frame[2] == servo_id and frame[4] == cmd:
+                    return frame
+        return None
+    finally:
+        ser.timeout = old_timeout
+
+
+def write_commands(ser: serial.Serial,
+                   commands: list[tuple[int, int, tuple[int, ...]]],
+                   flush: bool = True):
+    """把多条写指令拼成一次写入；flush=False 用于 50Hz 步态热路径。"""
+    block = bytearray()
+    for servo_id, cmd, params in commands:
+        block += build_frame(servo_id, cmd, tuple(params))
+    if block:
+        ser.write(bytes(block))
+        if flush:
+            ser.flush()
+
+
+def drain_until_quiet(ser: serial.Serial, quiet_s: float = 0.02,
+                      max_wait_s: float = 0.25):
+    """把串口里仍在到达的数据完整读走，避免残留帧造成错位。"""
+    old_timeout = ser.timeout
+    ser.timeout = 0.02
+    try:
+        deadline = time.time() + max_wait_s
+        while time.time() < deadline:
+            chunk = ser.read(4096)
+            if chunk:
+                continue
+            time.sleep(quiet_s)
+            if not ser.in_waiting:
+                break
+    finally:
+        ser.timeout = old_timeout
+
+
+# ---------------------------------------------------------------- 全局配置
 
 SERVO_IDS = list(range(1, 19))
-
-# ---------------------------------------------------------------- 步态参数
+DEFAULT_IDS = "1-18"
+RETRY_WAITS = (0.08, 0.20)
 
 WALK_SPEED_DEFAULT = 350.0      # mm/s，正数前进、负数后退
 WALK_SPEED_LIMIT = 500.0        # mm/s
-WALK_STRIDE_DEFAULT = 100.0     # mm，足端在每个支撑/摆动相内扫过的距离（前后各摆 stride/2）
+WALK_STRIDE_DEFAULT = 100.0     # mm
 STRAFE_SPEED_DEFAULT = WALK_SPEED_DEFAULT
-STRAFE_STRIDE_DEFAULT = 100.0   # mm，横向移动时足端在每个支撑/摆动相内扫过的左右距离
-TURN_SPEED_DEFAULT = 80.0      # deg/s，正数俯视逆时针（左转）、负数右转
+STRAFE_STRIDE_DEFAULT = 100.0   # mm
+TURN_SPEED_DEFAULT = 80.0       # deg/s，正数俯视逆时针（左转）
 TURN_SPEED_LIMIT = 100.0        # deg/s
-TURN_STEP_DEFAULT = 20.0       # deg，每个步态周期身体旋转的角度（左右各转 step/2）
-WALK_FRAME_PERIOD = 0.02       # s，帧周期：50Hz 稳定指令下达
-WALK_MOVE_TIME_MS = 20         # 每帧舵机移动时间，与 20ms 帧周期一致（18 帧 @115200 线上约 15.6ms）
-WALK_STAND_MOVE_TIME_MS = 100  # 启动/停止时回到自然站立的移动时间
+TURN_STEP_DEFAULT = 20.0        # deg/周期
+WALK_FRAME_PERIOD = 0.02        # s，50Hz
+WALK_MOVE_TIME_MS = 20          # 每帧舵机移动时间
+WALK_STAND_MOVE_TIME_MS = 100   # 站立/回中移动时间
+WALK_SCHEDULE_AHEAD_S = 0.0015  # 提前醒来后用忙等补齐帧间隔
 
-# 每帧末尾提前醒来、用忙等补齐剩余时间的余量；把 20ms 帧间隔抖动压到
-# 毫秒级以内，而不是依赖 time.sleep 的调度粒度。
-WALK_SCHEDULE_AHEAD_S = 0.0015
-
-# 每帧舵机移动时间必须与帧周期一致：舵机恰好在一个周期内到达目标，
-# 下一帧的新目标才能连续衔接（位置流式下发）。修改帧周期时务必同步改两者。
 assert WALK_MOVE_TIME_MS == round(WALK_FRAME_PERIOD * 1000), (
     "WALK_MOVE_TIME_MS 必须等于 WALK_FRAME_PERIOD 的毫秒数"
 )
 
-# ---------------------------------------------------------------- 内置数据
-
-# stand、walk、strafe 与 turn 共享同一 IK/步态实例：避免每次命令都重新解析
-# physical_config.json，也保证两处使用的物理参数完全一致。
+# stand/walk/strafe/turn 共享同一 IK 与步态实例，避免重复解析配置文件。
 IK = HexapodIK()
 GAIT = TripodGait(ik=IK)
 
-
-def natural_stand_pose() -> dict[int, int]:
-    """自然站立姿态：由 IK 按 physical_config.json 生成（含 5° 前偏）。"""
-    return {int(sid): int(round(pos)) for sid, pos in GAIT.stand_pose().items()}
-
-
-# 展平姿态：所有舵机回到配置中的默认展平位置
 FLATTEN_POSE = {
     sid: int(IK.config.get("default_flatten_position", 512)) for sid in SERVO_IDS
 }
 
+
+def natural_stand_pose() -> dict[int, int]:
+    """由 IK 按 physical_config.json 生成自然站立姿态。"""
+    return {int(sid): int(round(pos)) for sid, pos in GAIT.stand_pose().items()}
+
+
 # ---------------------------------------------------------------- 舵机读写
 
-# 协议帧的构造/解析/收发统一在 servo_protocol.py；这里只封装
-# 「读位置」「移动」「加载/卸载」三类高层操作。
+
+def read_position(ser: serial.Serial, servo_id: int,
+                  wait_s: float = 0.08) -> int | None:
+    """读取单个舵机位置，无应答返回 None。"""
+    frame = send_command(ser, servo_id, CMD_SERVO_POS_READ, wait_s=wait_s)
+    if frame is None or len(frame) < 8:
+        return None
+    return frame[5] | (frame[6] << 8)
 
 
 def read_servos(ser: serial.Serial, ids: list[int],
                 wait_s: float = 0.08) -> list[tuple[int, int]]:
-    """逐个读取舵机位置，返回应答成功的 [(舵机ID, 位置)]。
-
-    直连协议没有多舵机批量读取指令，只能按 ID 逐个查询；不在总线上
-    的舵机会等到各自的超时时间，因此 18 个舵机全离线时一次全量读取
-    约需 wait_s * 18 秒。
-    """
+    """逐个读取舵机位置，返回应答成功的 [(ID, 位置)]。"""
     result = []
     for servo_id in ids:
-        frame = send_command(ser, servo_id, CMD_SERVO_POS_READ, wait_s=wait_s)
-        if frame is None or len(frame) < 8:
-            continue
-        pos = frame[5] | (frame[6] << 8)
-        result.append((servo_id, pos))
+        pos = read_position(ser, servo_id, wait_s)
+        if pos is not None:
+            result.append((servo_id, pos))
     return result
 
 
-RETRY_WAITS = (0.08, 0.20)
-
-
 def read_with_retry(ser: serial.Serial, ids: list[int],
-                    waits: tuple[float, ...] = RETRY_WAITS) -> list[tuple[int, int]]:
-    """读取舵机位置，未应答的舵机用更长等待自动重试一次。"""
+                    waits: tuple[float, ...] = RETRY_WAITS
+                    ) -> list[tuple[int, int]]:
+    """读取位置；未应答的舵机清空串口后用更长等待重试一次。"""
     result = read_servos(ser, ids, wait_s=waits[0])
     answered = {servo_id for servo_id, _ in result}
     missing = [servo_id for servo_id in ids if servo_id not in answered]
     if not missing:
         return result
-    drain_until_quiet(ser)  # 清掉迟到/残留的半帧，避免污染重试结果
+    drain_until_quiet(ser)
     return result + read_servos(ser, missing, wait_s=waits[-1])
 
 
+def _set_torque(ser: serial.Serial, ids: list[int], enabled: bool):
+    """发送所有舵机的加载/卸载指令（0x1F，参数 0/1）。"""
+    param = 0x01 if enabled else 0x00
+    write_commands(ser, [(sid, CMD_SERVO_LOAD_OR_UNLOAD_WRITE, (param,))
+                         for sid in ids])
+
+
+def load_servos(ser: serial.Serial, ids: list[int]):
+    """加载（使能）舵机扭矩。"""
+    _set_torque(ser, ids, True)
+
+
+def unload_servos(ser: serial.Serial, ids: list[int]):
+    """卸载（失能）舵机扭矩，可手动转动。"""
+    _set_torque(ser, ids, False)
+
+
 def send_move(ser: serial.Serial, servos: list[tuple[int, int]], time_ms: int):
-    """让多个舵机在 time_ms 毫秒内移动到各自位置（0x01，无应答）。
+    """让多个舵机在 time_ms 内移动到各自位置（0x01，无应答）。
 
-    直连协议没有多舵机移动指令，这里把所有单舵机移动帧拼成一次写入，
-    保证 18 个舵机收到几乎相同的起始时间。时间参数范围 0-30000ms。
-
-    50Hz 控制环每帧只有 20ms，若等待整块 180 字节物理发完（约 15.6ms）
-    会挤占几乎整个周期，因此此处不 flush，由内核缓冲以线速率自然发出。
+    把所有单舵机移动帧拼成一次写入；步态热路径不 flush，交给内核缓冲
+    按 115200 线速率发出，避免 18 帧约 15.6ms 阻塞 20ms 控制周期。
     """
     time_ms = max(0, min(int(time_ms), 30000))
     commands = []
@@ -140,23 +239,9 @@ def send_move(ser: serial.Serial, servos: list[tuple[int, int]], time_ms: int):
         pos = max(0, min(int(pos), 1000))
         commands.append((servo_id, CMD_SERVO_MOVE_TIME_WRITE,
                          (pos & 0xFF, (pos >> 8) & 0xFF,
-                           time_ms & 0xFF, (time_ms >> 8) & 0xFF)))
+                          time_ms & 0xFF, (time_ms >> 8) & 0xFF)))
     write_commands(ser, commands, flush=False)
 
-
-def unload_servos(ser: serial.Serial, ids: list[int]):
-    """卸载（失能）所有舵机，参数 0 = 关闭扭矩。"""
-    write_commands(ser, [(servo_id, CMD_SERVO_LOAD_OR_UNLOAD_WRITE, (0x00,))
-                         for servo_id in ids])
-
-
-def load_servos(ser: serial.Serial, ids: list[int]):
-    """加载（使能）所有舵机，参数 1 = 打开扭矩。"""
-    write_commands(ser, [(servo_id, CMD_SERVO_LOAD_OR_UNLOAD_WRITE, (0x01,))
-                         for servo_id in ids])
-
-
-# ---------------------------------------------------------------- 姿态数据
 
 def load_pose(data: dict) -> list[tuple[int, int]]:
     """校验姿态数据，返回按 ID 排序的 [(舵机ID, 位置)]。"""
@@ -172,45 +257,113 @@ def load_pose(data: dict) -> list[tuple[int, int]]:
     return sorted(servos)
 
 
-# ---------------------------------------------------------------- 交互命令
+def quantize_pose(pose: dict[int, float]) -> list[tuple[int, int]]:
+    """把 IK 输出的浮点位置四舍五入为整数位置。"""
+    return [(int(servo_id), int(round(pos))) for servo_id, pos in pose.items()]
 
-def monitor_servos(ser: serial.Serial, ids: list[int], interval: float = 0.1):
-    """持续读取舵机位置，无响应自动重试，覆盖刷新同一行，Ctrl+C 停止。"""
-    print(f"持续读取 {ids[0]}-{ids[-1]} 号舵机，目标间隔 {interval:g} 秒"
-          f"（按 Ctrl+C 停止）")
-    drain_until_quiet(ser)  # 只在进入时清空一次，循环内不再清空
+
+# ---------------------------------------------------------------- 只读监视
+
+
+def parse_ids(text: str) -> list[int]:
+    """解析 --ids（逗号分隔或区间，如 1-6,13-18），去重并升序。"""
+    ids: list[int] = []
+    for part in text.replace(" ", "").split(","):
+        if not part:
+            continue
+        if "-" in part:
+            low, _, high = part.partition("-")
+            if not low.isdigit() or not high.isdigit():
+                raise argparse.ArgumentTypeError(f"无效的 ID 区间: {part!r}")
+            ids.extend(range(int(low), int(high) + 1))
+        elif part.isdigit():
+            ids.append(int(part))
+        else:
+            raise argparse.ArgumentTypeError(f"无效的 ID: {part!r}")
+    result = sorted(set(ids))
+    if not result:
+        raise argparse.ArgumentTypeError("--ids 至少需要一个 ID")
+    return result
+
+
+def ping(ser: serial.Serial, servo_id: int) -> bool:
+    """查询舵机是否在线。"""
+    return send_command(ser, servo_id, CMD_SERVO_ID_READ) is not None
+
+
+def discover(ser: serial.Serial, ids: list[int]) -> list[int]:
+    """扫描 ids，返回在线舵机 ID 列表。"""
+    online = [servo_id for servo_id in ids if ping(ser, servo_id)]
+    time.sleep(0.02)
+    return online
+
+
+def monitor_servos(ser: serial.Serial, ids: list[int], interval: float = 0.0):
+    """只读持续打印舵机位置；全部失联后自动重新扫描在线 ID。"""
+    print(f"监视 ID: {ids}  @ {ser.baudrate} baud（只读，Ctrl+C 退出）")
+    print("正在扫描在线舵机...")
+    online = discover(ser, ids)
+    if online:
+        print(f"在线: {online}；离线 ID: "
+              f"{[sid for sid in ids if sid not in online]}")
+    else:
+        print("未发现在线舵机，将每 2 秒重新扫描一次。")
+
+    offline_count = 0
     ema_cycle = None
+    last_t = None
     try:
         while True:
-            start = time.time()
-            result = read_with_retry(ser, ids)
-            if result:
-                positions = dict(result)
-                line = " ".join(f"{sid}:{positions[sid]}" for sid in ids
-                                if sid in positions)
-            else:
-                line = "(无响应)"
-            elapsed = time.time() - start
-            ema_cycle = elapsed if ema_cycle is None else \
-                0.8 * ema_cycle + 0.2 * elapsed
-            hz = 1.0 / ema_cycle if ema_cycle > 0 else 0.0
-            print(f"\r\x1b[2K[{time.strftime('%H:%M:%S')}] {hz:4.1f}Hz  {line}",
-                  end="", flush=True)
-            if interval > 0:
-                time.sleep(max(0.0, interval - (time.time() - start)))
+            if not online:
+                time.sleep(2.0)
+                online = discover(ser, ids)
+                if online:
+                    print(f"\r\x1b[2K发现在线舵机: {online}", flush=True)
+                last_t = None
+                ema_cycle = None
+                continue
+
+            positions = {sid: pos for sid in online
+                         if (pos := read_position(ser, sid)) is not None}
+            offline_count = 0 if positions else offline_count + 1
+
+            parts = [
+                f"{sid}:{positions[sid]}" if sid in positions else f"{sid}:-"
+                for sid in online
+            ]
+            now = time.time()
+            if last_t is not None:
+                dt = now - last_t
+                ema_cycle = dt if ema_cycle is None else 0.8 * ema_cycle + 0.2 * dt
+            last_t = now
+            hz = 1.0 / ema_cycle if ema_cycle else 0.0
+            print(f"\r\x1b[2K[{time.strftime('%H:%M:%S')}] {hz:4.1f}Hz  "
+                  + " ".join(parts), end="", flush=True)
+
+            if offline_count >= 5:
+                print("\r\x1b[2K舵机全部失联，重新扫描在线舵机...", flush=True)
+                online = discover(ser, ids)
+                offline_count = 0
+                last_t = None
+                ema_cycle = None
+            elif interval > 0:
+                time.sleep(interval)
     except KeyboardInterrupt:
-        print("\r\x1b[2K已停止读取，回到命令输入。")
+        print("\r\x1b[2K已停止监视。")
+
+
+# ---------------------------------------------------------------- 姿态命令
 
 
 def cmd_pose(ser: serial.Serial, name: str, pose: dict, time_ms: int):
+    """加载扭矩、发送姿态并等待到位。"""
     servos = load_pose(pose)
     print(f"{name}姿态: " + " ".join(f"{sid}:{pos}" for sid, pos in servos))
-    load_servos(ser, [servo_id for servo_id, _ in servos])
+    load_servos(ser, [sid for sid, _ in servos])
     send_move(ser, servos, time_ms)
     print(f"已发送移动指令（{len(servos)} 个舵机，{time_ms}ms 内到位）")
-    wait = max(0.2, time_ms / 1000 + 0.5)
     try:
-        time.sleep(wait)
+        time.sleep(max(0.2, time_ms / 1000 + 0.5))
     except KeyboardInterrupt:
         print("等待被中断；移动指令已发送，舵机仍会完成到位。")
         return
@@ -218,17 +371,13 @@ def cmd_pose(ser: serial.Serial, name: str, pose: dict, time_ms: int):
 
 
 def cmd_relax(ser: serial.Serial):
+    """卸载全部 18 个舵机。"""
     unload_servos(ser, SERVO_IDS)
     print("已发送卸载指令，18 个舵机失能，可手动转动。")
 
 
-def quantize_pose(pose: dict[int, float]) -> list[tuple[int, int]]:
-    """把 IK 输出的浮点舵机位置四舍五入成可序列化的整数位置。"""
-    return [(int(servo_id), int(round(pos))) for servo_id, pos in pose.items()]
-
-
 def _direction_label(vx: float, vy: float) -> str:
-    """把身体坐标系速度向量翻译成中文方向名（vx 前正、vy 左正）。"""
+    """把身体坐标速度向量翻译成中文方向名（vx 前正、vy 左正）。"""
     angle = (math.degrees(math.atan2(vy, vx)) + 360.0) % 360.0
     labels = ("前进", "左前方", "左移", "左后方",
               "后退", "右后方", "右移", "右前方")
@@ -237,15 +386,16 @@ def _direction_label(vx: float, vy: float) -> str:
 
 # ---------------------------------------------------------------- 步态循环
 
+
 def _smoothstep(t: float) -> float:
-    """平滑阶跃：t 在 [0, 1] 上从 0 平滑过渡到 1，两端一阶导为 0。"""
+    """t 在 [0, 1] 上从 0 平滑过渡到 1。"""
     t = min(1.0, max(0.0, t))
     return t * t * (3.0 - 2.0 * t)
 
 
 def _hold_stand(ser: serial.Serial, stand_pose: dict[int, float],
                 reason: str):
-    """发送自然站立姿态并短暂等待（速度/步幅为 0 等不启动步态的情况）。"""
+    """速度为 0 等无需步态时，发送自然站立姿态并短暂等待。"""
     load_servos(ser, SERVO_IDS)
     send_move(ser, quantize_pose(stand_pose), WALK_STAND_MOVE_TIME_MS)
     print(reason)
@@ -257,7 +407,7 @@ def _hold_stand(ser: serial.Serial, stand_pose: dict[int, float],
 
 def _wait_stand_complete(should_stop: Callable[[], bool] | None,
                          wait_s: float, name: str) -> bool:
-    """等待站立到位，期间响应停止信号或 Ctrl+C；返回 False 表示应中止步态。"""
+    """等待站立到位；返回 False 表示应中止步态。"""
     try:
         deadline = time.monotonic() + wait_s
         while time.monotonic() < deadline:
@@ -273,7 +423,7 @@ def _wait_stand_complete(should_stop: Callable[[], bool] | None,
 
 def _stand_up(ser: serial.Serial, stand_pose: dict[int, float],
               name: str, should_stop: Callable[[], bool] | None) -> bool:
-    """加载扭矩并站到自然姿态；返回 False 表示被取消，应中止步态。"""
+    """加载扭矩并站到自然姿态；返回 False 表示应中止步态。"""
     load_servos(ser, SERVO_IDS)
     send_move(ser, quantize_pose(stand_pose), WALK_STAND_MOVE_TIME_MS)
     return _wait_stand_complete(
@@ -285,33 +435,22 @@ def _run_gait_loop(ser: serial.Serial, pose_fn: Callable[..., dict[int, float]],
                    stand_pose: dict[int, float],
                    cycle_s: float, ramp_s: float, name: str,
                    should_stop: Callable[[], bool] | None):
-    """运行步态帧循环并负责安全停止，供平移与旋转两类步态共用。
+    """按 50Hz 帧周期运行步态，安全停止并回到自然站立姿态。
 
-    pose_fn(phase, *amps) 返回当前幅值下的 18 个舵机位置；target_amps 是
-    爬升结束后的目标幅值（平移为 (x 步幅, y 步幅)，旋转为 (单周期转角,)）。
-    启动后幅值在 ramp_s（约 1.5 个周期）内从 0 平滑爬升；收到停止信号后
-    不立即回中，而是走完当前半步、把幅值平滑降到 0，等当前摆动组落地后
-    停在自然站立姿态，避免中断步态造成的“往回拉”。任何退出路径（Ctrl+C、
-    IK 越界、异常）都会回到自然站立姿态。
-
-    指令按固定帧周期 WALK_FRAME_PERIOD（默认 50Hz）下达：每帧末尾先
-    sleep 到临近截止时间，再用忙等补齐，避免调度粒度造成帧间隔抖动。
-    循环期间禁用 GC、进入前排空 RX 残留字节，并统计滑帧（帧间隔超过
-    125% 帧周期记一次），结束时不依赖滑帧与否都会打印帧间隔统计。
+    启动后幅值在 ramp_s 内从 0 平滑爬升；停止时走完当前半步并把幅值
+    平滑降到 0，最后回到自然站立。循环期间禁用 GC 并统计滑帧。
     """
     start = time.monotonic()
     stopping = False
     stop_phase = 0.0
     amps_at_stop = target_amps
     finish_span = 0.5
-    # 滑帧统计：帧间隔超过 125% 帧周期记为一次滑帧（默认阈值 25ms）
     slip_limit_s = WALK_FRAME_PERIOD * 1.25
     frame_slips = 0
     max_gap_s = 0.0
     prev_frame_start = start
-    gc.disable()  # 步态对帧周期敏感，禁用 GC 避免偶发停顿造成滑帧
+    gc.disable()
     try:
-        # 清掉此前 read/monitor 等命令残留的应答字节，保持热路径 RX 干净
         ser.reset_input_buffer()
         while True:
             frame_start = time.monotonic()
@@ -319,13 +458,12 @@ def _run_gait_loop(ser: serial.Serial, pose_fn: Callable[..., dict[int, float]],
             prev_frame_start = frame_start
             if gap > slip_limit_s:
                 frame_slips += 1
-                if gap > max_gap_s:
-                    max_gap_s = gap
+                max_gap_s = max(max_gap_s, gap)
+
             elapsed = frame_start - start
             phase = (elapsed / cycle_s) % 1.0
 
             if stopping:
-                # 幅值按平滑阶跃从停止点衰减到 0
                 progress = ((phase - stop_phase) % 1.0) / finish_span
                 amps = tuple(a * (1.0 - _smoothstep(progress))
                              for a in amps_at_stop)
@@ -335,21 +473,17 @@ def _run_gait_loop(ser: serial.Serial, pose_fn: Callable[..., dict[int, float]],
                 stop_phase = phase
                 amps_at_stop = tuple(a * _smoothstep(elapsed / ramp_s)
                                      for a in target_amps)
-                # 目标为下一个半步边界（0.5 相位），即当前摆动组落地瞬间
                 finish_span = math.ceil(phase * 2.0) / 2.0 - phase
                 if finish_span < 0.05:
                     finish_span += 0.5
                 amps = amps_at_stop
             else:
-                # 幅值在约 1.5 个周期内从 0 平滑爬升到目标值
                 amps = tuple(a * _smoothstep(elapsed / ramp_s)
                              for a in target_amps)
 
             pose = pose_fn(phase, *amps)
 
             if stopping and ((phase - stop_phase) % 1.0) >= finish_span:
-                # 幅值已降到 0，摆动组已落地：当前姿态就是自然站立，
-                # 直接交给 finally 稳住即可
                 break
             send_move(ser, quantize_pose(pose), WALK_MOVE_TIME_MS)
 
@@ -365,7 +499,7 @@ def _run_gait_loop(ser: serial.Serial, pose_fn: Callable[..., dict[int, float]],
     except UnreachableFootError as exc:
         print(f"\n目标轨迹超出腿部工作空间，{name}提前停止: {exc}")
     finally:
-        gc.enable()  # 无论何种退出路径，先恢复 GC
+        gc.enable()
         send_move(ser, quantize_pose(stand_pose), WALK_STAND_MOVE_TIME_MS)
         print(f"{name}已停止，已回到自然站立姿态。")
         print(f"帧间隔统计：滑帧 {frame_slips} 次，最大间隔 {max_gap_s*1000:.1f} ms"
@@ -376,20 +510,14 @@ def _run_gait_loop(ser: serial.Serial, pose_fn: Callable[..., dict[int, float]],
             print()
 
 
+# ---------------------------------------------------------------- 步态命令
+
+
 def cmd_move(ser: serial.Serial, vx_mm_s: float, vy_mm_s: float,
              stride_mm: float | None = None,
              *, should_stop: Callable[[], bool] | None = None,
              stand_first: bool = True):
-    """按身体坐标系速度 (vx, vy) 平移，Ctrl+C 停止并回到自然站立姿态。
-
-    vx 正值前进、负值后退；vy 正值左移、负值右移；两者同时给出时合成
-    任意水平方向（等大同号即 45° 斜向）。合速度大小钳制到 WALK_SPEED_LIMIT
-    （方向不变）。stride_mm 是足端在每个支撑/摆动相内沿合速度方向扫过的
-    距离，默认 WALK_STRIDE_DEFAULT；周期 T = 2*stride/speed，支撑相内足端
-    相对身体反向移动，保证足端在地面不打滑。启动时先发送自然站立姿态，
-    随后步幅在约 1.5 个周期内从 0 平滑爬升。should_stop 与 stand_first
-    的含义同 cmd_gait。
-    """
+    """按身体坐标速度 (vx, vy) 平移；vx 前正、vy 左正。"""
     vx = float(vx_mm_s)
     vy = float(vy_mm_s)
     if not math.isfinite(vx) or not math.isfinite(vy):
@@ -413,18 +541,15 @@ def cmd_move(ser: serial.Serial, vx_mm_s: float, vy_mm_s: float,
         if not math.isfinite(stride):
             print(f"无效的步幅: {stride_mm!r}（必须为有限数值）")
             return
-    stand_pose = GAIT.stand_pose()
 
+    stand_pose = GAIT.stand_pose()
     if speed < 1e-9 or stride <= 0:
         _hold_stand(ser, stand_pose, "速度为 0 或步幅非正，已发送自然站立姿态。")
         return
 
-    # 合速度方向的单位向量：把总步幅按方向分解到身体 x/y 两个轴。
     ux, uy = vx / speed, vy / speed
     stride_target_x = stride * ux
     stride_target_y = stride * uy
-    # 支撑/摆动相各扫过 stride，占半个周期；要让足端在地面不打滑，
-    # 周期必须是 2*stride/speed（而不是 stride/speed）。
     cycle_s = 2.0 * stride / speed
     ramp_s = 1.5 * cycle_s
     print(f"开始步态：速度 {speed:.1f} mm/s（{_direction_label(vx, vy)}，"
@@ -442,18 +567,14 @@ def cmd_gait(ser: serial.Serial, speed_mm_s: float,
              stride_mm: float | None, *, lateral: bool,
              should_stop: Callable[[], bool] | None = None,
              stand_first: bool = True):
-    """以三角步态前后行走或左右平移，Ctrl+C 停止并回到自然站立姿态。
-
-    lateral=False 时走前后方向：speed_mm_s 正值前进、负值后退；
-    lateral=True 时横向移动：speed_mm_s 正值左移、负值右移。
-    本函数把单轴速度换算成身体坐标速度向量 (vx, vy)，其余参数与行为
-    见 cmd_move。
-    """
+    """前后行走或左右平移；lateral=True 时正数为左移。"""
     if stride_mm is None:
-        stride_mm = STRAFE_STRIDE_DEFAULT if lateral else WALK_STRIDE_DEFAULT
+        stride = STRAFE_STRIDE_DEFAULT if lateral else WALK_STRIDE_DEFAULT
+    else:
+        stride = stride_mm
     vx = 0.0 if lateral else float(speed_mm_s)
     vy = float(speed_mm_s) if lateral else 0.0
-    cmd_move(ser, vx, vy, stride_mm,
+    cmd_move(ser, vx, vy, stride,
              should_stop=should_stop, stand_first=stand_first)
 
 
@@ -461,7 +582,7 @@ def cmd_walk(ser: serial.Serial, speed_mm_s: float,
              stride_mm: float | None = None,
              *, should_stop: Callable[[], bool] | None = None,
              stand_first: bool = True):
-    """以三角步态前后行走；参数含义见 cmd_gait。"""
+    """三角步态前进/后退（正数前进）。"""
     cmd_gait(ser, speed_mm_s, stride_mm, lateral=False,
              should_stop=should_stop, stand_first=stand_first)
 
@@ -470,7 +591,7 @@ def cmd_strafe(ser: serial.Serial, speed_mm_s: float,
                stride_mm: float | None = None,
                *, should_stop: Callable[[], bool] | None = None,
                stand_first: bool = True):
-    """以三角步态左右平移（正数左移、负数右移）；参数含义见 cmd_gait。"""
+    """三角步态左右平移（正数左移）。"""
     cmd_gait(ser, speed_mm_s, stride_mm, lateral=True,
              should_stop=should_stop, stand_first=stand_first)
 
@@ -479,19 +600,7 @@ def cmd_turn(ser: serial.Serial, speed_deg_s: float,
              step_deg: float | None = None,
              *, should_stop: Callable[[], bool] | None = None,
              stand_first: bool = True):
-    """以三角步态原地旋转，Ctrl+C 停止并回到自然站立姿态。
-
-    speed_deg_s 为正值时俯视逆时针（左转）、负值时顺时针（右转），
-    范围钳制到 ±TURN_SPEED_LIMIT；step_deg 是每个完整步态周期身体旋转的
-    角度，默认取 TURN_STEP_DEFAULT，不做钳制；超出腿部工作空间时打印提示
-    并安全回到自然站立姿态。
-    周期 T = 2*step/speed：支撑相内身体旋转 step、足端相对身体反向旋转
-    step，保证足端在地面不打滑。启动时先发送自然站立姿态，随后转角在
-    约 1.5 个周期内从 0 平滑爬升。should_stop 为可选回调，每个步态帧
-    检查一次，返回 True 时走完当前半步、把转角平滑降到 0，等当前摆动组
-    落地后停在自然站立姿态。stand_first=False 时跳过启动前的站立流程
-    直接进入旋转循环，适用于机器人已经处于自然站立姿态的场景。
-    """
+    """三角步态原地旋转（正数俯视逆时针/左转）。"""
     speed = float(speed_deg_s)
     if not math.isfinite(speed):
         print(f"无效的旋转速度: {speed_deg_s!r}（必须为有限数值）")
@@ -509,21 +618,18 @@ def cmd_turn(ser: serial.Serial, speed_deg_s: float,
         if not math.isfinite(step):
             print(f"无效的单周期转角: {step_deg!r}（必须为有限数值）")
             return
-    stand_pose = GAIT.stand_pose()
 
+    stand_pose = GAIT.stand_pose()
     if abs(speed) < 1e-9 or step <= 0:
         _hold_stand(ser, stand_pose,
                     "旋转速度为 0 或单周期转角非正，已发送自然站立姿态。")
         return
 
     direction = "左转（俯视逆时针）" if speed > 0 else "右转（俯视顺时针）"
-    # 支撑/摆动相各扫过 step，占半个周期；要让足端在地面不打滑，
-    # 周期必须是 2*step/speed（而不是 step/speed）。
     cycle_s = 2.0 * abs(step) / abs(speed)
     ramp_s = 1.5 * cycle_s
     print(f"开始原地旋转：角速度 {speed:+.1f} deg/s（{direction}），"
-          f"单周期转角 {step:g}°，周期 {cycle_s:.3f} s。"
-          f"按 Ctrl+C 停止。")
+          f"单周期转角 {step:g}°，周期 {cycle_s:.3f} s。按 Ctrl+C 停止。")
 
     if stand_first and not _stand_up(ser, stand_pose, "旋转", should_stop):
         return
@@ -535,21 +641,22 @@ def cmd_turn(ser: serial.Serial, speed_deg_s: float,
                    should_stop)
 
 
+# ---------------------------------------------------------------- 交互控制台
+
+
 def print_help():
     print(
         "可用命令:\n"
-        "  read     持续读取 1-18 号舵机位置并覆盖打印，无响应自动重试\n"
+        "  read     扫描在线舵机并持续打印位置，全部失联自动重扫\n"
         "           可选目标间隔(秒): read 0.05，read 0 为最快\n"
         "  stand    站立（内置姿态）\n"
         "  flatten  展平（内置姿态）\n"
-        "  walk     以三角步态行走（可选速度 mm/s 和步幅 mm，"
+        "  walk     行走（可选速度 mm/s 和步幅 mm，"
         f"默认 {WALK_SPEED_DEFAULT:g} {WALK_STRIDE_DEFAULT:g}）\n"
-        "  strafe   以三角步态左右平移（可选速度 mm/s 和步幅 mm，"
-        f"默认 {STRAFE_SPEED_DEFAULT:g} {STRAFE_STRIDE_DEFAULT:g}，"
-        "正数左移、负数右移）\n"
+        "  strafe   左右平移（可选速度 mm/s 和步幅 mm，"
+        f"默认 {STRAFE_SPEED_DEFAULT:g} {STRAFE_STRIDE_DEFAULT:g}，正数左移）\n"
         "  turn     原地旋转（可选角速度 deg/s 和单周期转角 deg，"
-        f"默认 {TURN_SPEED_DEFAULT:g} {TURN_STEP_DEFAULT:g}，"
-        "正数左转、负数右转）\n"
+        f"默认 {TURN_SPEED_DEFAULT:g} {TURN_STEP_DEFAULT:g}，正数左转）\n"
         "  move     按速度向量平移（可选 vx vy，mm/s，默认 "
         f"{WALK_SPEED_DEFAULT:g} 0；vx 前正、vy 左正）\n"
         "  relax    卸载所有舵机（失能，可手动转动）\n"
@@ -568,6 +675,14 @@ def _parse_float_arg(tokens: list[str], index: int,
         return None, f"无效的{name}: {raw!r}"
 
 
+def _parse_optional_float(tokens: list[str], index: int, name: str,
+                          default: float | None) -> tuple[float | None, str | None]:
+    """解析可选 float 参数；缺省返回 default，非法返回错误提示。"""
+    if len(tokens) <= index:
+        return default, None
+    return _parse_float_arg(tokens, index, name)
+
+
 def run_repl(ser: serial.Serial, move_time_ms: int):
     print("Spiderbot 舵机驱动程序已启动。输入命令（help 查看帮助，quit 退出）。\n")
     while True:
@@ -576,83 +691,64 @@ def run_repl(ser: serial.Serial, move_time_ms: int):
         except (EOFError, KeyboardInterrupt):
             print()
             break
-
         if not line:
             continue
+
         tokens = line.split()
         command = tokens[0]
         try:
             if command in ("read", "r"):
-                interval = 0.1
-                if len(tokens) > 1:
-                    interval, error = _parse_float_arg(tokens, 1, "刷新间隔")
-                    if error:
-                        print(error)
-                        continue
-                    if not math.isfinite(interval) or interval < 0:
-                        print(f"无效的刷新间隔: {tokens[1]!r}（必须为有限的非负数）")
-                        continue
-                monitor_servos(ser, SERVO_IDS, interval)
+                interval, error = _parse_optional_float(tokens, 1, "刷新间隔", 0.1)
+                if error:
+                    print(error)
+                elif not math.isfinite(interval) or interval < 0:
+                    print(f"无效的刷新间隔: {tokens[1]!r}（必须为有限的非负数）")
+                else:
+                    monitor_servos(ser, SERVO_IDS, interval)
             elif command in ("stand", "s") and len(tokens) == 1:
                 cmd_pose(ser, "站立", natural_stand_pose(), move_time_ms)
             elif command in ("flatten", "f") and len(tokens) == 1:
                 cmd_pose(ser, "展平", FLATTEN_POSE, move_time_ms)
             elif command in ("walk", "w"):
-                speed = WALK_SPEED_DEFAULT
-                stride = None
-                if len(tokens) > 1:
-                    speed, error = _parse_float_arg(tokens, 1, "速度")
-                    if error:
-                        print(error)
-                        continue
-                if len(tokens) > 2:
-                    stride, error = _parse_float_arg(tokens, 2, "步幅")
-                    if error:
-                        print(error)
-                        continue
-                cmd_walk(ser, speed, stride)
+                speed, error = _parse_optional_float(tokens, 1, "速度",
+                                                     WALK_SPEED_DEFAULT)
+                stride, error2 = _parse_optional_float(tokens, 2, "步幅", None)
+                if error:
+                    print(error)
+                elif error2:
+                    print(error2)
+                else:
+                    cmd_walk(ser, speed, stride)
             elif command in ("strafe", "slide", "lr"):
-                speed = STRAFE_SPEED_DEFAULT
-                stride = None
-                if len(tokens) > 1:
-                    speed, error = _parse_float_arg(tokens, 1, "速度")
-                    if error:
-                        print(error)
-                        continue
-                if len(tokens) > 2:
-                    stride, error = _parse_float_arg(tokens, 2, "步幅")
-                    if error:
-                        print(error)
-                        continue
-                cmd_strafe(ser, speed, stride)
+                speed, error = _parse_optional_float(tokens, 1, "速度",
+                                                     STRAFE_SPEED_DEFAULT)
+                stride, error2 = _parse_optional_float(tokens, 2, "步幅", None)
+                if error:
+                    print(error)
+                elif error2:
+                    print(error2)
+                else:
+                    cmd_strafe(ser, speed, stride)
             elif command in ("move", "mv"):
-                vx = WALK_SPEED_DEFAULT
-                vy = 0.0
-                if len(tokens) > 1:
-                    vx, error = _parse_float_arg(tokens, 1, "前向速度")
-                    if error:
-                        print(error)
-                        continue
-                if len(tokens) > 2:
-                    vy, error = _parse_float_arg(tokens, 2, "横向速度")
-                    if error:
-                        print(error)
-                        continue
-                cmd_move(ser, vx, vy)
+                vx, error = _parse_optional_float(tokens, 1, "前向速度",
+                                                  WALK_SPEED_DEFAULT)
+                vy, error2 = _parse_optional_float(tokens, 2, "横向速度", 0.0)
+                if error:
+                    print(error)
+                elif error2:
+                    print(error2)
+                else:
+                    cmd_move(ser, vx, vy)
             elif command in ("turn", "rotate", "rot"):
-                speed = TURN_SPEED_DEFAULT
-                step = None
-                if len(tokens) > 1:
-                    speed, error = _parse_float_arg(tokens, 1, "旋转速度")
-                    if error:
-                        print(error)
-                        continue
-                if len(tokens) > 2:
-                    step, error = _parse_float_arg(tokens, 2, "单周期转角")
-                    if error:
-                        print(error)
-                        continue
-                cmd_turn(ser, speed, step)
+                speed, error = _parse_optional_float(tokens, 1, "旋转速度",
+                                                     TURN_SPEED_DEFAULT)
+                step, error2 = _parse_optional_float(tokens, 2, "单周期转角", None)
+                if error:
+                    print(error)
+                elif error2:
+                    print(error2)
+                else:
+                    cmd_turn(ser, speed, step)
             elif command == "relax" and len(tokens) == 1:
                 cmd_relax(ser)
             elif command in ("help", "h", "?") and len(tokens) == 1:
@@ -665,26 +761,51 @@ def run_repl(ser: serial.Serial, move_time_ms: int):
             print(f"执行失败: {exc}")
 
 
+# ---------------------------------------------------------------- 入口
+
+
+def _open_serial_or_exit(port: str, baud: int) -> serial.Serial:
+    try:
+        return open_serial(port, baud)
+    except serial.SerialException as exc:
+        print(f"无法打开串口 {port}: {exc}")
+        print("请检查 USB 总线模块是否连接，或使用 --port 指定正确设备。")
+        sys.exit(1)
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Spiderbot 六足机器人舵机驱动程序")
+    parser = argparse.ArgumentParser(
+        description="Spiderbot 六足机器人串行舵机控制/监视程序")
     parser.add_argument("--port", default=PORT, help=f"串口设备 (默认 {PORT})")
     parser.add_argument("--baud", type=int, default=BAUD,
                         help=f"波特率 (默认 {BAUD})")
     parser.add_argument("--time", type=int, default=1500,
                         help="站立/展平的舵机移动时间毫秒数 (默认 1500)")
+    parser.add_argument("--monitor", action="store_true",
+                        help="运行只读位置监视器（不进入交互控制台）")
+    parser.add_argument("--ids", type=parse_ids, default=DEFAULT_IDS,
+                        help=f"监视器要监视的舵机 ID (默认 {DEFAULT_IDS})")
+    parser.add_argument("--interval", type=float, default=0.0,
+                        help="监视器刷新间隔秒，0 为最快 (默认 0)")
     args = parser.parse_args()
 
-    if args.time <= 0:
-        parser.error("--time 必须大于 0")
     if args.baud <= 0:
         parser.error("--baud 必须大于 0")
+    if args.time <= 0:
+        parser.error("--time 必须大于 0")
+    if args.monitor and not 0 <= args.interval <= 10:
+        parser.error("--interval 必须在 0-10 之间")
 
-    try:
-        ser = open_serial(args.port, args.baud)
-    except serial.SerialException as exc:
-        print(f"无法打开串口 {args.port}: {exc}")
-        print("请检查 USB 总线模块是否连接，或使用 --port 指定正确设备。")
-        sys.exit(1)
+    ser = _open_serial_or_exit(args.port, args.baud)
+
+    if args.monitor:
+        time.sleep(0.2)
+        try:
+            monitor_servos(ser, args.ids, args.interval)
+        finally:
+            ser.close()
+            print("串口已关闭，程序退出。")
+        return
 
     try:
         run_repl(ser, args.time)
@@ -692,7 +813,7 @@ def main():
         try:
             # 退出前自动失能全部舵机，避免机器人保持僵硬的最后姿态
             unload_servos(ser, SERVO_IDS)
-            time.sleep(0.1)  # 等待总线模块发送完卸载帧
+            time.sleep(0.1)
             print("程序退出，18 个舵机已自动失能。")
         except OSError as exc:
             print(f"程序退出时自动失能失败: {exc}")

@@ -9,7 +9,7 @@
 | 文件 | 职责 |
 | --- | --- |
 | `kinematics.py` | 纯数学层：正/逆运动学、三角步态轨迹生成。无 I/O、无副作用，可独立测试 |
-| `servo_driver.py` | 串口协议 + 步态控制循环 + 交互控制台（REPL） |
+| `servo_driver.py` | 串口协议 + 只读位置监视 + 步态控制循环 + 交互控制台（REPL）。原 `servo_protocol.py` / `servo_monitor.py` 已合并到本文件 |
 | `keyboard_detect.py` | 键盘实时控制（W/S/A/D 平移、Q/E 旋转、斜向组合，松开即停） |
 | `physical_config.json` | **唯一的物理参数来源**：腿几何、舵机映射、关节限位、角度约定、安装坐标 |
 
@@ -51,6 +51,14 @@ python3 servo_driver.py [--port /dev/ttyUSB0] [--baud 115200] [--time 1500]
 | `turn [角速度] [单周期转角]` | 原地旋转（正数左转，默认 80 deg/s / 20°） |
 | `relax` | 卸载所有舵机（失能，可手动转动） |
 | `help` / `quit` | 显示帮助 / 退出（退出前自动失能全部舵机） |
+
+### 只读位置监视
+
+```bash
+python3 servo_driver.py --monitor [--port /dev/ttyUSB0] [--baud 115200] [--ids 1-18] [--interval 0]
+```
+
+`--ids` 支持逗号分隔或区间，例如 `1-18`、`13,14,15`、`1-6,13-18`。
 
 ### 键盘控制
 
