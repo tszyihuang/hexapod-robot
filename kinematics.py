@@ -29,7 +29,7 @@ IK 求解返回的是未量化的浮点舵机位置（0-1000 有效量程），�
   foot = mount + (coxa + reach) * (cos(theta0), sin(theta0)), z = -H
 
 theta0 按腿分别取值：以各腿髋舵机的安装朝向（位置 512 时的指向）为基准，
-前/中/后腿分别为 ±45° / ±90° / ±135°（右腿取负），再向身体前方偏约 5°。
+前/中/后腿分别为 ±45° / ±90° / ±135°（右腿取负），不再附加其他偏置。
 
 相位约定：全局相位 phase 随时间线性前进，u = (phase - 偏移) mod 1。
   - 支撑相 0 <= u < 0.5：足端从 natural + stride/2 线性后退到
@@ -332,7 +332,6 @@ class TripodGait:
         self,
         ik: HexapodIK | None = None,
         body_height: float = 70.0,
-        forward_bias_deg: float = 5.0,
         reach: float = 90.0,
         stride: float = 60.0,
         step_height: float = 30.0,
@@ -350,15 +349,11 @@ class TripodGait:
         for leg_id in TRIPOD_B:
             self.offsets[leg_id] = 0.5
 
-        # 每条腿的自然方向（弧度）：以髋舵机安装朝向为基准，向前偏 5°
+        # 每条腿的自然方向（弧度）：即髋舵机安装朝向（位置 512 时的指向）
         self.natural_direction: dict[int, float] = {}
         for leg_id in self.leg_ids:
-            anchor = self.ik.hip_anchors[leg_id]
-            if self.ik.sides[leg_id] == "left":
-                direction = anchor - float(forward_bias_deg)
-            else:
-                direction = anchor + float(forward_bias_deg)
-            self.natural_direction[leg_id] = math.radians(direction)
+            self.natural_direction[leg_id] = math.radians(
+                self.ik.hip_anchors[leg_id])
 
     # ------------------------------------------------------------- 自然姿态
 

@@ -1,0 +1,662 @@
+<?xml version="1.0"?>
+<!-- 由 generate_urdf.py 从 physical_config.json 自动生成，勿手改；修改配置后重新生成。 -->
+<robot name="hexapod">
+  <!--
+    六足机器人 URDF 模型（Spiderbot，Hiwonder LX-15D x 18）。
+    单位：m、rad。坐标系：x 前、y 左、z 上，原点在身体中心。
+    关节零位 = 全部舵机位于默认展平位置 512：髋指向安装朝向、大腿水平、小腿与大腿同向伸直。
+    关节角度符号与 physical_config.json 一致（见 generate_urdf.py 头部说明）。
+  -->
+
+  <!-- ================= 身体 ================= -->
+  <link name="base_link">
+    <visual name="body_plate">
+      <origin xyz="0.000000 0.000000 0.000000" rpy="0 0 0"/>
+      <geometry><box size="0.260000 0.210000 0.030000"/></geometry>
+      <material name="mat_body_plate"><color rgba="0.28 0.30 0.34 1"/></material>
+    </visual>
+    <visual name="hip_servo_leg1">
+      <origin xyz="-0.118000 0.058000 -0.015000" rpy="0 0 0"/>
+      <geometry><box size="0.044000 0.022000 0.030000"/></geometry>
+      <material name="mat_hip_servo_leg1"><color rgba="0.10 0.10 0.12 1"/></material>
+    </visual>
+    <visual name="hip_servo_leg2">
+      <origin xyz="0.000000 0.090000 -0.015000" rpy="0 0 0"/>
+      <geometry><box size="0.044000 0.022000 0.030000"/></geometry>
+      <material name="mat_hip_servo_leg2"><color rgba="0.10 0.10 0.12 1"/></material>
+    </visual>
+    <visual name="hip_servo_leg3">
+      <origin xyz="0.118000 0.058000 -0.015000" rpy="0 0 0"/>
+      <geometry><box size="0.044000 0.022000 0.030000"/></geometry>
+      <material name="mat_hip_servo_leg3"><color rgba="0.10 0.10 0.12 1"/></material>
+    </visual>
+    <visual name="hip_servo_leg4">
+      <origin xyz="-0.118000 -0.058000 -0.015000" rpy="0 0 0"/>
+      <geometry><box size="0.044000 0.022000 0.030000"/></geometry>
+      <material name="mat_hip_servo_leg4"><color rgba="0.10 0.10 0.12 1"/></material>
+    </visual>
+    <visual name="hip_servo_leg5">
+      <origin xyz="0.000000 -0.090000 -0.015000" rpy="0 0 0"/>
+      <geometry><box size="0.044000 0.022000 0.030000"/></geometry>
+      <material name="mat_hip_servo_leg5"><color rgba="0.10 0.10 0.12 1"/></material>
+    </visual>
+    <visual name="hip_servo_leg6">
+      <origin xyz="0.118000 -0.058000 -0.015000" rpy="0 0 0"/>
+      <geometry><box size="0.044000 0.022000 0.030000"/></geometry>
+      <material name="mat_hip_servo_leg6"><color rgba="0.10 0.10 0.12 1"/></material>
+    </visual>
+    <inertial>
+      <origin xyz="0.000000 0.000000 0.000000" rpy="0 0 0"/>
+      <mass value="1.500000"/>
+      <inertia ixx="0.005625" ixy="0" ixz="0" iyy="0.008563" iyz="0" izz="0.013962"/>
+    </inertial>
+  </link>
+
+  <!-- ================= 腿 1（left；舵机 hip=1 femur=2 tibia=3） ================= -->
+  <link name="leg1_coxa">
+    <visual name="leg1_coxa_arm">
+      <origin xyz="0.021500 0.000000 0.000000" rpy="0 1.570796 0"/>
+      <geometry><cylinder radius="0.008000" length="0.043000"/></geometry>
+      <material name="mat_leg1_coxa_arm"><color rgba="0.85 0.45 0.10 1"/></material>
+    </visual>
+    <visual name="leg1_femur_servo">
+      <origin xyz="0.043000 0.000000 0.000000" rpy="0 0 0"/>
+      <geometry><box size="0.046000 0.024000 0.032000"/></geometry>
+      <material name="mat_leg1_femur_servo"><color rgba="0.10 0.10 0.12 1"/></material>
+    </visual>
+    <inertial>
+      <origin xyz="0.028000 0.000000 0.000000" rpy="0 0 0"/>
+      <mass value="0.100000"/>
+      <inertia ixx="0.000015" ixy="0" ixz="0" iyy="0.000075" iyz="0" izz="0.000075"/>
+    </inertial>
+  </link>
+  <link name="leg1_femur">
+    <visual name="leg1_femur_arm">
+      <origin xyz="0.037500 0.000000 0.000000" rpy="0 1.570796 0"/>
+      <geometry><cylinder radius="0.007000" length="0.075000"/></geometry>
+      <material name="mat_leg1_femur_arm"><color rgba="0.30 0.68 0.34 1"/></material>
+    </visual>
+    <visual name="leg1_tibia_servo">
+      <origin xyz="0.075000 0.000000 0.000000" rpy="0 0 0"/>
+      <geometry><box size="0.046000 0.024000 0.032000"/></geometry>
+      <material name="mat_leg1_tibia_servo"><color rgba="0.10 0.10 0.12 1"/></material>
+    </visual>
+    <inertial>
+      <origin xyz="0.055000 0.000000 0.000000" rpy="0 0 0"/>
+      <mass value="0.090000"/>
+      <inertia ixx="0.000013" ixy="0" ixz="0" iyy="0.000115" iyz="0" izz="0.000115"/>
+    </inertial>
+  </link>
+  <link name="leg1_tibia">
+    <visual name="leg1_tibia_arm">
+      <origin xyz="0.070000 0.000000 0.000000" rpy="0 1.570796 0"/>
+      <geometry><cylinder radius="0.005000" length="0.140000"/></geometry>
+      <material name="mat_leg1_tibia_arm"><color rgba="0.25 0.45 0.75 1"/></material>
+    </visual>
+    <visual name="leg1_foot_tip">
+      <origin xyz="0.140000 0.000000 0.000000" rpy="0 0 0"/>
+      <geometry><sphere radius="0.010000"/></geometry>
+      <material name="mat_leg1_foot_tip"><color rgba="0.15 0.15 0.15 1"/></material>
+    </visual>
+    <inertial>
+      <origin xyz="0.070000 0.000000 0.000000" rpy="0 0 0"/>
+      <mass value="0.040000"/>
+      <inertia ixx="0.000001" ixy="0" ixz="0" iyy="0.000066" iyz="0" izz="0.000066"/>
+    </inertial>
+  </link>
+  <joint name="leg1_hip_joint" type="revolute">
+    <parent link="base_link"/>
+    <child link="leg1_coxa"/>
+    <origin xyz="-0.118000 0.058000 0.000000" rpy="0 0 2.356194"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-0.837758" upper="0.837758" effort="1.5" velocity="6.5"/>
+  </joint>
+  <joint name="leg1_femur_joint" type="revolute">
+    <parent link="leg1_coxa"/>
+    <child link="leg1_femur"/>
+    <origin xyz="0.043000 0.000000 0.000000" rpy="0 0 0"/>
+    <axis xyz="0 -1 0"/>
+    <limit lower="-1.625251" upper="1.725782" effort="1.5" velocity="6.5"/>
+  </joint>
+  <joint name="leg1_tibia_joint" type="revolute">
+    <parent link="leg1_femur"/>
+    <child link="leg1_tibia"/>
+    <origin xyz="0.075000 0.000000 0.000000" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.258731" upper="2.930059" effort="1.5" velocity="6.5"/>
+  </joint>
+
+  <!-- ================= 腿 2（left；舵机 hip=4 femur=5 tibia=6） ================= -->
+  <link name="leg2_coxa">
+    <visual name="leg2_coxa_arm">
+      <origin xyz="0.021500 0.000000 0.000000" rpy="0 1.570796 0"/>
+      <geometry><cylinder radius="0.008000" length="0.043000"/></geometry>
+      <material name="mat_leg2_coxa_arm"><color rgba="0.85 0.45 0.10 1"/></material>
+    </visual>
+    <visual name="leg2_femur_servo">
+      <origin xyz="0.043000 0.000000 0.000000" rpy="0 0 0"/>
+      <geometry><box size="0.046000 0.024000 0.032000"/></geometry>
+      <material name="mat_leg2_femur_servo"><color rgba="0.10 0.10 0.12 1"/></material>
+    </visual>
+    <inertial>
+      <origin xyz="0.028000 0.000000 0.000000" rpy="0 0 0"/>
+      <mass value="0.100000"/>
+      <inertia ixx="0.000015" ixy="0" ixz="0" iyy="0.000075" iyz="0" izz="0.000075"/>
+    </inertial>
+  </link>
+  <link name="leg2_femur">
+    <visual name="leg2_femur_arm">
+      <origin xyz="0.037500 0.000000 0.000000" rpy="0 1.570796 0"/>
+      <geometry><cylinder radius="0.007000" length="0.075000"/></geometry>
+      <material name="mat_leg2_femur_arm"><color rgba="0.30 0.68 0.34 1"/></material>
+    </visual>
+    <visual name="leg2_tibia_servo">
+      <origin xyz="0.075000 0.000000 0.000000" rpy="0 0 0"/>
+      <geometry><box size="0.046000 0.024000 0.032000"/></geometry>
+      <material name="mat_leg2_tibia_servo"><color rgba="0.10 0.10 0.12 1"/></material>
+    </visual>
+    <inertial>
+      <origin xyz="0.055000 0.000000 0.000000" rpy="0 0 0"/>
+      <mass value="0.090000"/>
+      <inertia ixx="0.000013" ixy="0" ixz="0" iyy="0.000115" iyz="0" izz="0.000115"/>
+    </inertial>
+  </link>
+  <link name="leg2_tibia">
+    <visual name="leg2_tibia_arm">
+      <origin xyz="0.070000 0.000000 0.000000" rpy="0 1.570796 0"/>
+      <geometry><cylinder radius="0.005000" length="0.140000"/></geometry>
+      <material name="mat_leg2_tibia_arm"><color rgba="0.25 0.45 0.75 1"/></material>
+    </visual>
+    <visual name="leg2_foot_tip">
+      <origin xyz="0.140000 0.000000 0.000000" rpy="0 0 0"/>
+      <geometry><sphere radius="0.010000"/></geometry>
+      <material name="mat_leg2_foot_tip"><color rgba="0.15 0.15 0.15 1"/></material>
+    </visual>
+    <inertial>
+      <origin xyz="0.070000 0.000000 0.000000" rpy="0 0 0"/>
+      <mass value="0.040000"/>
+      <inertia ixx="0.000001" ixy="0" ixz="0" iyy="0.000066" iyz="0" izz="0.000066"/>
+    </inertial>
+  </link>
+  <joint name="leg2_hip_joint" type="revolute">
+    <parent link="base_link"/>
+    <child link="leg2_coxa"/>
+    <origin xyz="0.000000 0.090000 0.000000" rpy="0 0 1.570796"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-0.837758" upper="0.837758" effort="1.5" velocity="6.5"/>
+  </joint>
+  <joint name="leg2_femur_joint" type="revolute">
+    <parent link="leg2_coxa"/>
+    <child link="leg2_femur"/>
+    <origin xyz="0.043000 0.000000 0.000000" rpy="0 0 0"/>
+    <axis xyz="0 -1 0"/>
+    <limit lower="-1.625251" upper="1.725782" effort="1.5" velocity="6.5"/>
+  </joint>
+  <joint name="leg2_tibia_joint" type="revolute">
+    <parent link="leg2_femur"/>
+    <child link="leg2_tibia"/>
+    <origin xyz="0.075000 0.000000 0.000000" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.258731" upper="2.930059" effort="1.5" velocity="6.5"/>
+  </joint>
+
+  <!-- ================= 腿 3（left；舵机 hip=7 femur=8 tibia=9） ================= -->
+  <link name="leg3_coxa">
+    <visual name="leg3_coxa_arm">
+      <origin xyz="0.021500 0.000000 0.000000" rpy="0 1.570796 0"/>
+      <geometry><cylinder radius="0.008000" length="0.043000"/></geometry>
+      <material name="mat_leg3_coxa_arm"><color rgba="0.85 0.45 0.10 1"/></material>
+    </visual>
+    <visual name="leg3_femur_servo">
+      <origin xyz="0.043000 0.000000 0.000000" rpy="0 0 0"/>
+      <geometry><box size="0.046000 0.024000 0.032000"/></geometry>
+      <material name="mat_leg3_femur_servo"><color rgba="0.10 0.10 0.12 1"/></material>
+    </visual>
+    <inertial>
+      <origin xyz="0.028000 0.000000 0.000000" rpy="0 0 0"/>
+      <mass value="0.100000"/>
+      <inertia ixx="0.000015" ixy="0" ixz="0" iyy="0.000075" iyz="0" izz="0.000075"/>
+    </inertial>
+  </link>
+  <link name="leg3_femur">
+    <visual name="leg3_femur_arm">
+      <origin xyz="0.037500 0.000000 0.000000" rpy="0 1.570796 0"/>
+      <geometry><cylinder radius="0.007000" length="0.075000"/></geometry>
+      <material name="mat_leg3_femur_arm"><color rgba="0.30 0.68 0.34 1"/></material>
+    </visual>
+    <visual name="leg3_tibia_servo">
+      <origin xyz="0.075000 0.000000 0.000000" rpy="0 0 0"/>
+      <geometry><box size="0.046000 0.024000 0.032000"/></geometry>
+      <material name="mat_leg3_tibia_servo"><color rgba="0.10 0.10 0.12 1"/></material>
+    </visual>
+    <inertial>
+      <origin xyz="0.055000 0.000000 0.000000" rpy="0 0 0"/>
+      <mass value="0.090000"/>
+      <inertia ixx="0.000013" ixy="0" ixz="0" iyy="0.000115" iyz="0" izz="0.000115"/>
+    </inertial>
+  </link>
+  <link name="leg3_tibia">
+    <visual name="leg3_tibia_arm">
+      <origin xyz="0.070000 0.000000 0.000000" rpy="0 1.570796 0"/>
+      <geometry><cylinder radius="0.005000" length="0.140000"/></geometry>
+      <material name="mat_leg3_tibia_arm"><color rgba="0.25 0.45 0.75 1"/></material>
+    </visual>
+    <visual name="leg3_foot_tip">
+      <origin xyz="0.140000 0.000000 0.000000" rpy="0 0 0"/>
+      <geometry><sphere radius="0.010000"/></geometry>
+      <material name="mat_leg3_foot_tip"><color rgba="0.15 0.15 0.15 1"/></material>
+    </visual>
+    <inertial>
+      <origin xyz="0.070000 0.000000 0.000000" rpy="0 0 0"/>
+      <mass value="0.040000"/>
+      <inertia ixx="0.000001" ixy="0" ixz="0" iyy="0.000066" iyz="0" izz="0.000066"/>
+    </inertial>
+  </link>
+  <joint name="leg3_hip_joint" type="revolute">
+    <parent link="base_link"/>
+    <child link="leg3_coxa"/>
+    <origin xyz="0.118000 0.058000 0.000000" rpy="0 0 0.785398"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-0.837758" upper="0.837758" effort="1.5" velocity="6.5"/>
+  </joint>
+  <joint name="leg3_femur_joint" type="revolute">
+    <parent link="leg3_coxa"/>
+    <child link="leg3_femur"/>
+    <origin xyz="0.043000 0.000000 0.000000" rpy="0 0 0"/>
+    <axis xyz="0 -1 0"/>
+    <limit lower="-1.625251" upper="1.725782" effort="1.5" velocity="6.5"/>
+  </joint>
+  <joint name="leg3_tibia_joint" type="revolute">
+    <parent link="leg3_femur"/>
+    <child link="leg3_tibia"/>
+    <origin xyz="0.075000 0.000000 0.000000" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.258731" upper="2.930059" effort="1.5" velocity="6.5"/>
+  </joint>
+
+  <!-- ================= 腿 4（right；舵机 hip=10 femur=11 tibia=12） ================= -->
+  <link name="leg4_coxa">
+    <visual name="leg4_coxa_arm">
+      <origin xyz="0.021500 0.000000 0.000000" rpy="0 1.570796 0"/>
+      <geometry><cylinder radius="0.008000" length="0.043000"/></geometry>
+      <material name="mat_leg4_coxa_arm"><color rgba="0.85 0.45 0.10 1"/></material>
+    </visual>
+    <visual name="leg4_femur_servo">
+      <origin xyz="0.043000 0.000000 0.000000" rpy="0 0 0"/>
+      <geometry><box size="0.046000 0.024000 0.032000"/></geometry>
+      <material name="mat_leg4_femur_servo"><color rgba="0.10 0.10 0.12 1"/></material>
+    </visual>
+    <inertial>
+      <origin xyz="0.028000 0.000000 0.000000" rpy="0 0 0"/>
+      <mass value="0.100000"/>
+      <inertia ixx="0.000015" ixy="0" ixz="0" iyy="0.000075" iyz="0" izz="0.000075"/>
+    </inertial>
+  </link>
+  <link name="leg4_femur">
+    <visual name="leg4_femur_arm">
+      <origin xyz="0.037500 0.000000 0.000000" rpy="0 1.570796 0"/>
+      <geometry><cylinder radius="0.007000" length="0.075000"/></geometry>
+      <material name="mat_leg4_femur_arm"><color rgba="0.30 0.68 0.34 1"/></material>
+    </visual>
+    <visual name="leg4_tibia_servo">
+      <origin xyz="0.075000 0.000000 0.000000" rpy="0 0 0"/>
+      <geometry><box size="0.046000 0.024000 0.032000"/></geometry>
+      <material name="mat_leg4_tibia_servo"><color rgba="0.10 0.10 0.12 1"/></material>
+    </visual>
+    <inertial>
+      <origin xyz="0.055000 0.000000 0.000000" rpy="0 0 0"/>
+      <mass value="0.090000"/>
+      <inertia ixx="0.000013" ixy="0" ixz="0" iyy="0.000115" iyz="0" izz="0.000115"/>
+    </inertial>
+  </link>
+  <link name="leg4_tibia">
+    <visual name="leg4_tibia_arm">
+      <origin xyz="0.070000 0.000000 0.000000" rpy="0 1.570796 0"/>
+      <geometry><cylinder radius="0.005000" length="0.140000"/></geometry>
+      <material name="mat_leg4_tibia_arm"><color rgba="0.25 0.45 0.75 1"/></material>
+    </visual>
+    <visual name="leg4_foot_tip">
+      <origin xyz="0.140000 0.000000 0.000000" rpy="0 0 0"/>
+      <geometry><sphere radius="0.010000"/></geometry>
+      <material name="mat_leg4_foot_tip"><color rgba="0.15 0.15 0.15 1"/></material>
+    </visual>
+    <inertial>
+      <origin xyz="0.070000 0.000000 0.000000" rpy="0 0 0"/>
+      <mass value="0.040000"/>
+      <inertia ixx="0.000001" ixy="0" ixz="0" iyy="0.000066" iyz="0" izz="0.000066"/>
+    </inertial>
+  </link>
+  <joint name="leg4_hip_joint" type="revolute">
+    <parent link="base_link"/>
+    <child link="leg4_coxa"/>
+    <origin xyz="-0.118000 -0.058000 0.000000" rpy="0 0 -2.356194"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-0.837758" upper="0.837758" effort="1.5" velocity="6.5"/>
+  </joint>
+  <joint name="leg4_femur_joint" type="revolute">
+    <parent link="leg4_coxa"/>
+    <child link="leg4_femur"/>
+    <origin xyz="0.043000 0.000000 0.000000" rpy="0 0 0"/>
+    <axis xyz="0 -1 0"/>
+    <limit lower="-1.725782" upper="1.625251" effort="1.5" velocity="6.5"/>
+  </joint>
+  <joint name="leg4_tibia_joint" type="revolute">
+    <parent link="leg4_femur"/>
+    <child link="leg4_tibia"/>
+    <origin xyz="0.075000 0.000000 0.000000" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.359262" upper="2.829528" effort="1.5" velocity="6.5"/>
+  </joint>
+
+  <!-- ================= 腿 5（right；舵机 hip=13 femur=14 tibia=15） ================= -->
+  <link name="leg5_coxa">
+    <visual name="leg5_coxa_arm">
+      <origin xyz="0.021500 0.000000 0.000000" rpy="0 1.570796 0"/>
+      <geometry><cylinder radius="0.008000" length="0.043000"/></geometry>
+      <material name="mat_leg5_coxa_arm"><color rgba="0.85 0.45 0.10 1"/></material>
+    </visual>
+    <visual name="leg5_femur_servo">
+      <origin xyz="0.043000 0.000000 0.000000" rpy="0 0 0"/>
+      <geometry><box size="0.046000 0.024000 0.032000"/></geometry>
+      <material name="mat_leg5_femur_servo"><color rgba="0.10 0.10 0.12 1"/></material>
+    </visual>
+    <inertial>
+      <origin xyz="0.028000 0.000000 0.000000" rpy="0 0 0"/>
+      <mass value="0.100000"/>
+      <inertia ixx="0.000015" ixy="0" ixz="0" iyy="0.000075" iyz="0" izz="0.000075"/>
+    </inertial>
+  </link>
+  <link name="leg5_femur">
+    <visual name="leg5_femur_arm">
+      <origin xyz="0.037500 0.000000 0.000000" rpy="0 1.570796 0"/>
+      <geometry><cylinder radius="0.007000" length="0.075000"/></geometry>
+      <material name="mat_leg5_femur_arm"><color rgba="0.30 0.68 0.34 1"/></material>
+    </visual>
+    <visual name="leg5_tibia_servo">
+      <origin xyz="0.075000 0.000000 0.000000" rpy="0 0 0"/>
+      <geometry><box size="0.046000 0.024000 0.032000"/></geometry>
+      <material name="mat_leg5_tibia_servo"><color rgba="0.10 0.10 0.12 1"/></material>
+    </visual>
+    <inertial>
+      <origin xyz="0.055000 0.000000 0.000000" rpy="0 0 0"/>
+      <mass value="0.090000"/>
+      <inertia ixx="0.000013" ixy="0" ixz="0" iyy="0.000115" iyz="0" izz="0.000115"/>
+    </inertial>
+  </link>
+  <link name="leg5_tibia">
+    <visual name="leg5_tibia_arm">
+      <origin xyz="0.070000 0.000000 0.000000" rpy="0 1.570796 0"/>
+      <geometry><cylinder radius="0.005000" length="0.140000"/></geometry>
+      <material name="mat_leg5_tibia_arm"><color rgba="0.25 0.45 0.75 1"/></material>
+    </visual>
+    <visual name="leg5_foot_tip">
+      <origin xyz="0.140000 0.000000 0.000000" rpy="0 0 0"/>
+      <geometry><sphere radius="0.010000"/></geometry>
+      <material name="mat_leg5_foot_tip"><color rgba="0.15 0.15 0.15 1"/></material>
+    </visual>
+    <inertial>
+      <origin xyz="0.070000 0.000000 0.000000" rpy="0 0 0"/>
+      <mass value="0.040000"/>
+      <inertia ixx="0.000001" ixy="0" ixz="0" iyy="0.000066" iyz="0" izz="0.000066"/>
+    </inertial>
+  </link>
+  <joint name="leg5_hip_joint" type="revolute">
+    <parent link="base_link"/>
+    <child link="leg5_coxa"/>
+    <origin xyz="0.000000 -0.090000 0.000000" rpy="0 0 -1.570796"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-0.837758" upper="0.837758" effort="1.5" velocity="6.5"/>
+  </joint>
+  <joint name="leg5_femur_joint" type="revolute">
+    <parent link="leg5_coxa"/>
+    <child link="leg5_femur"/>
+    <origin xyz="0.043000 0.000000 0.000000" rpy="0 0 0"/>
+    <axis xyz="0 -1 0"/>
+    <limit lower="-1.725782" upper="1.625251" effort="1.5" velocity="6.5"/>
+  </joint>
+  <joint name="leg5_tibia_joint" type="revolute">
+    <parent link="leg5_femur"/>
+    <child link="leg5_tibia"/>
+    <origin xyz="0.075000 0.000000 0.000000" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.359262" upper="2.829528" effort="1.5" velocity="6.5"/>
+  </joint>
+
+  <!-- ================= 腿 6（right；舵机 hip=16 femur=17 tibia=18） ================= -->
+  <link name="leg6_coxa">
+    <visual name="leg6_coxa_arm">
+      <origin xyz="0.021500 0.000000 0.000000" rpy="0 1.570796 0"/>
+      <geometry><cylinder radius="0.008000" length="0.043000"/></geometry>
+      <material name="mat_leg6_coxa_arm"><color rgba="0.85 0.45 0.10 1"/></material>
+    </visual>
+    <visual name="leg6_femur_servo">
+      <origin xyz="0.043000 0.000000 0.000000" rpy="0 0 0"/>
+      <geometry><box size="0.046000 0.024000 0.032000"/></geometry>
+      <material name="mat_leg6_femur_servo"><color rgba="0.10 0.10 0.12 1"/></material>
+    </visual>
+    <inertial>
+      <origin xyz="0.028000 0.000000 0.000000" rpy="0 0 0"/>
+      <mass value="0.100000"/>
+      <inertia ixx="0.000015" ixy="0" ixz="0" iyy="0.000075" iyz="0" izz="0.000075"/>
+    </inertial>
+  </link>
+  <link name="leg6_femur">
+    <visual name="leg6_femur_arm">
+      <origin xyz="0.037500 0.000000 0.000000" rpy="0 1.570796 0"/>
+      <geometry><cylinder radius="0.007000" length="0.075000"/></geometry>
+      <material name="mat_leg6_femur_arm"><color rgba="0.30 0.68 0.34 1"/></material>
+    </visual>
+    <visual name="leg6_tibia_servo">
+      <origin xyz="0.075000 0.000000 0.000000" rpy="0 0 0"/>
+      <geometry><box size="0.046000 0.024000 0.032000"/></geometry>
+      <material name="mat_leg6_tibia_servo"><color rgba="0.10 0.10 0.12 1"/></material>
+    </visual>
+    <inertial>
+      <origin xyz="0.055000 0.000000 0.000000" rpy="0 0 0"/>
+      <mass value="0.090000"/>
+      <inertia ixx="0.000013" ixy="0" ixz="0" iyy="0.000115" iyz="0" izz="0.000115"/>
+    </inertial>
+  </link>
+  <link name="leg6_tibia">
+    <visual name="leg6_tibia_arm">
+      <origin xyz="0.070000 0.000000 0.000000" rpy="0 1.570796 0"/>
+      <geometry><cylinder radius="0.005000" length="0.140000"/></geometry>
+      <material name="mat_leg6_tibia_arm"><color rgba="0.25 0.45 0.75 1"/></material>
+    </visual>
+    <visual name="leg6_foot_tip">
+      <origin xyz="0.140000 0.000000 0.000000" rpy="0 0 0"/>
+      <geometry><sphere radius="0.010000"/></geometry>
+      <material name="mat_leg6_foot_tip"><color rgba="0.15 0.15 0.15 1"/></material>
+    </visual>
+    <inertial>
+      <origin xyz="0.070000 0.000000 0.000000" rpy="0 0 0"/>
+      <mass value="0.040000"/>
+      <inertia ixx="0.000001" ixy="0" ixz="0" iyy="0.000066" iyz="0" izz="0.000066"/>
+    </inertial>
+  </link>
+  <joint name="leg6_hip_joint" type="revolute">
+    <parent link="base_link"/>
+    <child link="leg6_coxa"/>
+    <origin xyz="0.118000 -0.058000 0.000000" rpy="0 0 -0.785398"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-0.837758" upper="0.837758" effort="1.5" velocity="6.5"/>
+  </joint>
+  <joint name="leg6_femur_joint" type="revolute">
+    <parent link="leg6_coxa"/>
+    <child link="leg6_femur"/>
+    <origin xyz="0.043000 0.000000 0.000000" rpy="0 0 0"/>
+    <axis xyz="0 -1 0"/>
+    <limit lower="-1.725782" upper="1.625251" effort="1.5" velocity="6.5"/>
+  </joint>
+  <joint name="leg6_tibia_joint" type="revolute">
+    <parent link="leg6_femur"/>
+    <child link="leg6_tibia"/>
+    <origin xyz="0.075000 0.000000 0.000000" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.359262" upper="2.829528" effort="1.5" velocity="6.5"/>
+  </joint>
+
+  <!-- ================= 传动块：关节 -> 舵机（ros_control PositionJointInterface） ================= -->
+  <transmission name="leg1_hip_trans">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="leg1_hip_joint">
+      <hardwareInterface>hardware_interface/PositionJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="servo_1">
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="leg1_femur_trans">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="leg1_femur_joint">
+      <hardwareInterface>hardware_interface/PositionJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="servo_2">
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="leg1_tibia_trans">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="leg1_tibia_joint">
+      <hardwareInterface>hardware_interface/PositionJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="servo_3">
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="leg2_hip_trans">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="leg2_hip_joint">
+      <hardwareInterface>hardware_interface/PositionJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="servo_4">
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="leg2_femur_trans">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="leg2_femur_joint">
+      <hardwareInterface>hardware_interface/PositionJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="servo_5">
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="leg2_tibia_trans">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="leg2_tibia_joint">
+      <hardwareInterface>hardware_interface/PositionJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="servo_6">
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="leg3_hip_trans">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="leg3_hip_joint">
+      <hardwareInterface>hardware_interface/PositionJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="servo_7">
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="leg3_femur_trans">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="leg3_femur_joint">
+      <hardwareInterface>hardware_interface/PositionJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="servo_8">
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="leg3_tibia_trans">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="leg3_tibia_joint">
+      <hardwareInterface>hardware_interface/PositionJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="servo_9">
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="leg4_hip_trans">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="leg4_hip_joint">
+      <hardwareInterface>hardware_interface/PositionJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="servo_10">
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="leg4_femur_trans">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="leg4_femur_joint">
+      <hardwareInterface>hardware_interface/PositionJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="servo_11">
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="leg4_tibia_trans">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="leg4_tibia_joint">
+      <hardwareInterface>hardware_interface/PositionJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="servo_12">
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="leg5_hip_trans">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="leg5_hip_joint">
+      <hardwareInterface>hardware_interface/PositionJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="servo_13">
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="leg5_femur_trans">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="leg5_femur_joint">
+      <hardwareInterface>hardware_interface/PositionJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="servo_14">
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="leg5_tibia_trans">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="leg5_tibia_joint">
+      <hardwareInterface>hardware_interface/PositionJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="servo_15">
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="leg6_hip_trans">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="leg6_hip_joint">
+      <hardwareInterface>hardware_interface/PositionJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="servo_16">
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="leg6_femur_trans">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="leg6_femur_joint">
+      <hardwareInterface>hardware_interface/PositionJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="servo_17">
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="leg6_tibia_trans">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="leg6_tibia_joint">
+      <hardwareInterface>hardware_interface/PositionJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="servo_18">
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+</robot>
