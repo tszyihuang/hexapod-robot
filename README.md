@@ -145,3 +145,15 @@ USB 总线模块直连舵机，帧格式
 ## 许可
 
 暂无 License 文件；如需引用或复用代码，请先联系作者。
+
+## 强化学习训练（rl/）
+
+同一台机器人的行走策略在 Isaac Lab 中训练（CPG + RL 架构，PPO）：
+
+- `rl/`：训练与展示代码，详见 `rl/README.md`
+- 策略输出 [步幅, 横移, 转角, 抬脚高, 步频, 身高] 6 个参数，
+  可直接喂给本项目的 `TripodGait` 步态管线，实现 sim2real 部署
+
+```bash
+cd rl && python play_cpg.py --realistic   # 实机同款参数步态演示（需 Isaac Lab 环境）
+```
