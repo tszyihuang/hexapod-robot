@@ -3,7 +3,7 @@
 这是"CPG + RL"架构的核心：优雅的步态由数学保证，而不是靠奖励函数打补丁。
 
 参数 -> 足端轨迹 -> 逆运动学 -> 关节角，全流程张量化（一次算 N 个平行世界 ×
-6 条腿），与仓库 kinematics.py 里的 TripodGait / HexapodIK 完全同源：
+6 条腿），与 src/kinematics.py 里的 TripodGait / HexapodIK 完全同源：
 
     步态模式：三角步态（腿 1/3/5 与 2/4/6 相位差 0.5）
       - 支撑相 0 <= u < 0.5：足端相对身体从 +stride/2 匀速后退到 -stride/2，贴地
@@ -31,7 +31,7 @@ from pathlib import Path
 import torch
 
 _THIS_DIR = Path(__file__).resolve().parent
-_CONFIG_PATH = _THIS_DIR.parent / "physical_config.json"
+_CONFIG_PATH = _THIS_DIR.parent / "src" / "physical_config.json"
 
 # 参数下标（动作空间顺序，改这里要同步改对称模块与部署代码）
 IDX_STRIDE, IDX_LATERAL, IDX_TURN, IDX_STEP_H, IDX_FREQ, IDX_H = range(6)

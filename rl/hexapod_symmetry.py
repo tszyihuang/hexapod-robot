@@ -4,7 +4,7 @@
 额外生成"左右镜像版"一起训练，强制策略满足：左侧状态下的决策 = 右侧镜像状态
 下的决策镜像——左右腿天然平衡。
 
-观测向量布局（56 维，与 hexapod_env_cfg.py 一致）：
+观测向量布局（58 维，与 hexapod_env_cfg.py 一致）：
     [ 0: 3)  线速度 (x, y, z)    ->  (x, -y, z)
     [ 3: 6)  角速度 (x, y, z)    ->  (-x, y, -z)   （角速度是伪矢量）
     [ 6: 9)  重力投影            ->  (x, -y, z)
@@ -14,6 +14,7 @@
     [48:54)  上一帧动作（6 个 CPG 参数）-> (+, -, -, +, +, +)
                  步幅不变、横移取反、转角取反、抬脚高/步频/身高不变
     [54:56)  CPG 相位            ->  不变
+    [56:58)  偏航角 (sin,cos)    ->  (-sin, +cos)（镜像世界偏航取反）
 
 动作（6 个 CPG 参数）：(+, -, -, +, +, +)，只取反号，不换位。
 
@@ -70,6 +71,7 @@ def _mirror_policy_obs(obs: torch.Tensor) -> torch.Tensor:
     obs[:, 6:9] = obs[:, 6:9] * torch.tensor([1, -1, 1], device=device)     # 重力
     obs[:, 45:48] = obs[:, 45:48] * torch.tensor([1, -1, -1], device=device)  # 指令
     obs[:, 48:54] = obs[:, 48:54] * _PARAM_SIGN.to(device)                  # CPG 参数
+    obs[:, 56:58] = obs[:, 56:58] * torch.tensor([-1, 1], device=device)    # 偏航角 sin/cos
     # 关节位置(9:27) / 关节速度(27:45)：左右腿互换
     for start in (9, 27):
         for k in range(3):  # 髋、大腿、小腿三个 6 关节块

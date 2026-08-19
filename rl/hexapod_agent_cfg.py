@@ -1,6 +1,6 @@
 """PPO 训练器配置（训练 train.py 与评估 play_trained.py 共用）。
 
-第 7 课调参时主要改这里。
+调参时主要改这里。
 """
 
 from isaaclab.utils import configclass
@@ -29,7 +29,7 @@ class HexapodPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     device = "cuda:0"
     # 观测分组：策略(actor)和评价(critic)都用 policy 组观测
     obs_groups = {"policy": ["policy"], "critic": ["policy"]}
-    # 神经网络结构：观测 68 维 -> 128 -> 128 -> 128 -> 动作 18 维
+    # 神经网络结构：观测 58 维 -> 128 -> 128 -> 128 -> 动作 6 维（CPG 步态参数）
     policy = RslRlPpoActorCriticCfg(
         init_noise_std=1.0,              # 初始探索噪声（越大越爱乱试）
         actor_obs_normalization=False,

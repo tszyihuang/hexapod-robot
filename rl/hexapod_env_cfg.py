@@ -9,7 +9,7 @@
 = 三角步态节律、左右镜像 = 对称），策略只需要学"用什么参数达到目标速度"，
 奖励函数因此可以保持极简（8 个标准项，零补丁）。
 
-关键换算（来自 physical_config.json 的 position_to_angle_formula）：
+关键换算（来自 src/physical_config.json 的 position_to_angle_formula）：
     舵机位置 pos(0-1000) 与关节角的换算 deg = (pos - 512) * 0.24
     站姿（实机 TripodGait(body_height=70, reach=90) 的站立位置）：
         髋 512、大腿 281(左)/743(右)、小腿 176(左)/848(右)
@@ -34,18 +34,19 @@ from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sensors import ContactSensorCfg
 from isaaclab.utils import configclass
+from isaaclab.utils.math import quat_apply
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
 from hexapod_cpg import IDX_FREQ, HexapodCPG
 
-# 机器人模型文件：注意必须用仓库根目录的 hexapod.usd（完整舞台，包含关节链根节点），
-# 而不是 configuration/hexapod_robot.usd（那只是一个引用外壳，单独加载没有实体）
+# 机器人模型文件：注意必须用 models/ 下的 hexapod.usd（完整舞台，包含关节链根节点），
+# 而不是 models/configuration/hexapod_robot.usd（那只是一个引用外壳，单独加载没有实体）
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-ROBOT_USD = os.path.join(_THIS_DIR, "..", "hexapod.usd")
+ROBOT_USD = os.path.join(_THIS_DIR, "..", "models", "hexapod.usd")
 
 # ---------------------------------------------------------------- 站立默认姿态
 # 实机自然站立姿态对应的 18 个 URDF 关节角（弧度）。
-# 用仓库里的 kinematics.py 可以复现这个结果：
+# 用 src/kinematics.py 可以复现这个结果：
 #     from kinematics import HexapodIK, TripodGait
 #     stand = TripodGait(ik=HexapodIK(), body_height=70.0, reach=90.0).stand_pose()
 # 然后按上面的换算公式转成 URDF 关节角。
@@ -205,9 +206,22 @@ def cpg_phase_obs(env: ManagerBasedRLEnv) -> torch.Tensor:
     )
 
 
+def yaw_obs(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """世界系偏航角（sin/cos，2 维）——策略的"指南针"。
+
+    没有它策略根本看不见自己的朝向：heading_deviation 惩罚想让它直行，但它
+    无从得知当前偏了多少、该往哪边打 turn 修正。加上后才能主动抵消步态的
+    净偏航漂移（旧策略 10 秒漂 80°+ 的根因之一）。
+    """
+    quat = env.scene["robot"].data.root_quat_w   # (N, 4) wxyz
+    w, x, y, z = quat[..., 0], quat[..., 1], quat[..., 2], quat[..., 3]
+    yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+    return torch.stack([torch.sin(yaw), torch.cos(yaw)], dim=-1)
+
+
 @configclass
 class ObservationsCfg:
-    """观测空间：56 维向量。
+    """观测空间：58 维向量。
 
     拼接顺序（类内定义顺序即向量顺序，训练后不能乱改）：
         索引 [ 0: 3)  身体线速度   base_lin_vel      m/s（身体坐标系）
@@ -218,6 +232,7 @@ class ObservationsCfg:
         索引 [45:48)  速度指令     velocity_commands (vx, vy, wz)
         索引 [48:54)  上一帧动作   last_action       6 个 CPG 参数 [-1,1]
         索引 [54:56)  CPG 相位     sin(2π·phase), cos(2π·phase)
+        索引 [56:58)  偏航角       sin(yaw), cos(yaw)（世界系指南针）
     """
 
     @configclass
@@ -235,6 +250,8 @@ class ObservationsCfg:
         actions = ObsTerm(func=mdp.last_action)
         # ---- CPG 相位（2 维）----
         cpg_phase = ObsTerm(func=cpg_phase_obs)
+        # ---- 偏航角（2 维）----
+        yaw = ObsTerm(func=yaw_obs)
 
         def __post_init__(self):
             self.concatenate_terms = True
@@ -248,7 +265,8 @@ class CommandsCfg:
     """任务指令：训练时环境周期性给机器人下达"速度指令"。
 
     先只练"直线前进"：速度 0.1~0.3 m/s 随机（每 5 秒换一次），10% 的环境指令
-    为 0（练站立）。CPG 架构天然支持横移/转向，第 7 课再开 vy/wz 指令。
+    为 0（练站立）。CPG 架构天然支持横移/转向，后续如需横向与转向指令，
+    放开下方 ranges 的 lin_vel_y / ang_vel_z 即可。
     """
 
     base_velocity = mdp.UniformVelocityCommandCfg(
@@ -267,24 +285,99 @@ class CommandsCfg:
     )
 
 
+# ---------------------------------------------------------------- 自定义惩罚项
+# 足尖在胫节(tibia) link 坐标系中的位置：URDF 中 foot_tip 球心位于 (0.14, 0, 0)
+FOOT_TIP_LOCAL = (0.14, 0.0, 0.0)
+# 六条腿的胫节刚体（足端），按正则匹配
+FOOT_BODY_RE = ".*tibia"
+
+
+def feet_slide_penalty(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """足端打滑惩罚：支撑相中段、着地稳定的足端，其水平滑动速度越大惩罚越重。
+
+    正常步态支撑相足尖相对地面静止（身体从足上"走过"）；打滑时足尖在地面横向
+    搓动。注意胫节 link 帧原点在膝关节——支撑相膝关节以体速前进，必须用
+    v_tip = v_link + ω × r_tip 换算到足尖点才是真实的打滑速度。
+
+    只在 CPG 相位 u ∈ (0.1, 0.4) 的"支撑相中段"生效：摆动相结束落地瞬间足端
+    轨迹水平速度高达 ~3× 体速（落地前的自然滑动），若按接触掩码全部计入，
+    会把正常行走误判成打滑，导致策略缩步幅原地踏步。
+    """
+    robot = env.scene["robot"]
+    sensor = env.scene["contact_forces"]
+    cpg_term = env.action_manager.get_term("cpg")
+
+    # 支撑相中段掩码：每条腿相位 u = (phase - offset) % 1，u ∈ (0.1, 0.4) 为稳定支撑
+    phase = cpg_term.phase                                        # (N,)
+    offsets = cpg_term.cpg.offsets                                # (6,)
+    u = (phase.unsqueeze(-1) - offsets.unsqueeze(0)) % 1.0        # (N,6)
+    solid_stance = (u > 0.1) & (u < 0.4)
+
+    foot_ids, _ = robot.find_bodies(FOOT_BODY_RE)      # 足端在 articulation 中的索引
+    sensor_ids, _ = sensor.find_bodies(FOOT_BODY_RE)   # 足端在接触传感器中的索引
+
+    # 足尖点速度（世界系）= link 线速度 + 角速度 × 足尖偏移
+    lin_vel = robot.data.body_link_vel_w[:, foot_ids, :3]   # (N, 6, 3)
+    ang_vel = robot.data.body_link_vel_w[:, foot_ids, 3:]   # (N, 6, 3)
+    quat = robot.data.body_link_quat_w[:, foot_ids]         # (N, 6, 4)
+    r_tip = quat_apply(
+        quat,
+        torch.tensor(FOOT_TIP_LOCAL, dtype=torch.float32, device=env.device).expand_as(lin_vel),
+    )
+    tip_vel = lin_vel + torch.linalg.cross(ang_vel, r_tip, dim=-1)
+
+    # 接触掩码：法向力模长超过 1N 视为支撑相
+    foot_force = sensor.data.net_forces_w[:, sensor_ids]
+    in_contact = torch.linalg.vector_norm(foot_force, dim=-1) > 1.0
+
+    # 只惩罚"支撑相中段 + 接触中"的足的水平滑动速度平方
+    mask = solid_stance & in_contact
+    slip = torch.sum(torch.square(tip_vel[:, :, :2]), dim=-1)
+    return torch.sum(slip * mask, dim=-1)
+
+
+def lin_vel_y_penalty(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """横向偏移惩罚：身体坐标系下的侧向速度绝对值（直行时应当 ≈ 0）。"""
+    return torch.abs(env.scene["robot"].data.root_lin_vel_b[:, 1])
+
+
+def ang_vel_z_penalty(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """偏航角速度惩罚：抑制原地转向/来回摆头（角速度惩罚压不住缓慢的净漂移）。"""
+    return torch.square(env.scene["robot"].data.root_ang_vel_b[:, 2])
+
+
+def heading_deviation_penalty(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """偏航角（净朝向）惩罚：直行时机器人世界系偏航角应保持 ≈ 出生朝向。
+
+    角速度惩罚只能压振荡，压不住每周期累积一点的净偏航漂移（旧策略 10 秒
+    偏 81°）；直接罚偏航角本身，策略会自动用 turn 参数抵消步态的自然偏航。
+    """
+    quat = env.scene["robot"].data.root_quat_w   # (N, 4) wxyz
+    w, x, y, z = quat[..., 0], quat[..., 1], quat[..., 2], quat[..., 3]
+    yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+    return torch.square(yaw)
+
+
 @configclass
 class RewardsCfg:
-    """奖励函数：8 个标准项，无任何自定义补丁。
+    """奖励函数：12 项 = 8 个标准项 + 打滑/横向/偏航角速度/偏航角 4 个直行质量惩罚。
 
     CPG 结构保证了步态平滑、对称、有节律，因此这里只需要"走对方向、走稳、
-    别摔"的基础评分。权重沿用 Isaac Lab 官方四足任务的惯例。
+    别摔、别打滑、别跑偏"的基础评分。速度追踪沿用 Isaac Lab 官方四足任务的惯例。
     """
 
     # -- 主任务：追踪速度指令 --
+    # std=0.2（比官方四足默认 0.5 更紧）：本机器人速度只有 0.1~0.3 m/s，
+    # 用 0.5 时 0.2 m/s 的速度误差奖励仍有 0.92（饱和），策略没动力提速
     track_lin_vel_xy_exp = RewTerm(
         func=mdp.track_lin_vel_xy_exp,
         weight=1.5,
-        params={"command_name": "base_velocity", "std": math.sqrt(0.25)},
+        params={"command_name": "base_velocity", "std": 0.2},
     )
     track_ang_vel_z_exp = RewTerm(
         func=mdp.track_ang_vel_z_exp,
         weight=0.5,
-        params={"command_name": "base_velocity", "std": math.sqrt(0.25)},
+        params={"command_name": "base_velocity", "std": 0.2},
     )
     # -- 姿态质量 --
     lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-2.0)                # 惩罚上下乱跳
@@ -293,6 +386,11 @@ class RewardsCfg:
     # -- 动作质量 --
     dof_torques_l2 = RewTerm(func=mdp.joint_torques_l2, weight=-1.0e-5)       # 省力（能耗）
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.01)           # 参数平滑变化
+    # -- 直行质量：打滑 + 偏移 --
+    feet_slide = RewTerm(func=feet_slide_penalty, weight=-1.0)    # 足端打滑（支撑相中段的水平滑动）
+    lin_vel_y = RewTerm(func=lin_vel_y_penalty, weight=-1.0)      # 横向偏移（侧向速度）
+    ang_vel_z = RewTerm(func=ang_vel_z_penalty, weight=-0.5)      # 偏航角速度（压摆动，别太狠以免牺牲步态）
+    heading_deviation = RewTerm(func=heading_deviation_penalty, weight=-1.5)  # 偏航角（压净漂移）
     # -- 安全 --
     undesired_contacts = RewTerm(
         func=mdp.undesired_contacts,
@@ -334,5 +432,6 @@ class HexapodEnvCfg(ManagerBasedRLEnvCfg):
         self.decimation = 4
         # 一个回合持续 10 秒
         self.episode_length_s = 10.0
-        # 接触传感器每个物理步都更新
-        self.scene.contact_forces.update_period = self.sim.dt
+        # 接触传感器每个控制步（50Hz）更新一次：undesired_contacts 奖励与 base_contact
+        # 终止都在控制步读取接触力，200Hz 更新纯属浪费（接触报告是本机每步固定开销大头之一）
+        self.scene.contact_forces.update_period = self.decimation * self.sim.dt

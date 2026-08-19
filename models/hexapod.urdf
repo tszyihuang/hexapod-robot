@@ -1,11 +1,11 @@
 <?xml version="1.0"?>
-<!-- 由 generate_urdf.py 从 physical_config.json 自动生成，勿手改；修改配置后重新生成。 -->
+<!-- 由 physical_config.json 自动生成（生成脚本已从仓库移除）；修改配置后请同步更新本文件。 -->
 <robot name="hexapod">
   <!--
     六足机器人 URDF 模型（Spiderbot，Hiwonder LX-15D x 18）。
     单位：m、rad。坐标系：x 前、y 左、z 上，原点在身体中心。
     关节零位 = 全部舵机位于默认展平位置 512：髋指向安装朝向、大腿水平、小腿与大腿同向伸直。
-    关节角度符号与 physical_config.json 一致（见 generate_urdf.py 头部说明）。
+    关节角度符号与 src/physical_config.json 一致。
   -->
 
   <!-- ================= 身体 ================= -->

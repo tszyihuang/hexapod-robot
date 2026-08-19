@@ -1,17 +1,18 @@
 # Spiderbot 六足机器人控制程序
 
 > 基于 Hiwonder LX-15D 串行总线舵机的六足机器人运动学与步态控制程序。
-> 机体为亚博（Yahboom）Spiderbot 六足原型机，从物理配置到逆运动学、
-> 三角步态、串口驱动，再到键盘遥控，一套纯 Python 实现。
+> 机体为亚博（Yahboom）Spiderbot 六足原型机：物理配置、逆运动学、三角步态、
+> 串口驱动与键盘遥控为纯 Python 实现；行走策略在 Isaac Lab 中以 CPG + RL
+> 训练，可与实机 sim2real 对接。
 >
 > *A Python hexapod robot control stack: kinematics, tripod gait, serial-bus
-> servo driver and keyboard teleoperation — config-driven, zero hardcoded magic
-> numbers.*
+> servo driver, keyboard teleoperation and a CPG+RL locomotion policy —
+> config-driven, zero hardcoded magic numbers.*
 
 ## 项目简介
 
 本项目为亚博（Yahboom）Spiderbot 六足原型机（18 舵机，6 腿 × 3 关节）
-提供完整的底层控制软件：以 `physical_config.json` 为唯一物理参数来源，通过解析
+提供完整的底层控制软件：以 `src/physical_config.json` 为唯一物理参数来源，通过解析
 逆运动学求解每条腿的舵机角度，生成三角步态（tripod gait）足端轨迹，
 经 USB 转总线模块以 115200 8N1 串口实时驱动 Hiwonder LX-15D 舵机。
 
@@ -24,9 +25,9 @@
 ## 特性
 
 - 🕷️ **纯 Python 运动学**：正/逆运动学与步态生成完全独立于硬件 I/O，
-  可在无机器人环境下离线测试（`kinematics.py` 仅依赖标准库）；
+  可在无机器人环境下离线测试（`src/kinematics.py` 仅依赖标准库）；
 - 📐 **配置驱动**：腿几何、舵机映射、关节限位、角度约定、安装坐标全部
-  来自 `physical_config.json`，改硬件参数无需改代码；
+  来自 `src/physical_config.json`，改硬件参数无需改代码；
 - 🦵 **三角步态**：支撑相/摆动相相位差 0.5，支撑相足端相对身体等速后退
   保证不打滑，支持任意水平速度向量合成（平移 + 横移 + 旋转）；
 - 🔌 **串行总线舵机协议**：LX-15D/LX-16A 帧的构造、校验与解析，
@@ -49,17 +50,26 @@
 
 ## 文件结构
 
-| 文件 | 职责 |
-| --- | --- |
-| `kinematics.py` | 纯数学层：正/逆运动学、三角步态轨迹生成。无 I/O、无副作用，可独立测试 |
-| `servo_driver.py` | 串口协议 + 只读位置监视 + 步态控制循环 + 交互控制台（REPL）。原 `servo_protocol.py` / `servo_monitor.py` 已合并到本文件 |
-| `keyboard_detect.py` | 键盘实时控制（W/S/A/D 平移、Q/E 旋转、斜向组合，松开即停） |
-| `physical_config.json` | **唯一的物理参数来源**：腿几何、舵机映射、关节限位、角度约定、安装坐标 |
-| `hexapod.urdf` | 机器人 URDF 模型（由配置自动生成，勿手改） |
-| `imu_monitor.py` | 亚博 IMU 姿态传感器监视器（只读，覆盖式打印） |
+```
+├── src/                     实机控制代码（纯 Python）
+│   ├── kinematics.py          纯数学层：正/逆运动学、三角步态轨迹生成，无 I/O
+│   ├── servo_driver.py        串口协议 + 位置监视 + 步态控制循环 + 交互控制台（REPL）
+│   ├── keyboard_detect.py     键盘实时遥控（W/S/A/D、Q/E、斜向组合）
+│   ├── imu_monitor.py         IMU 姿态传感器监视器（只读）
+│   └── physical_config.json   **唯一的物理参数来源**：腿几何、舵机映射、关节限位、角度约定
+├── models/                  机器人模型资产
+│   ├── hexapod.urdf           由配置生成的 URDF（生成脚本已移除，改配置需同步更新）
+│   ├── hexapod.usd            Isaac Sim 完整舞台（二进制 USDC，引用 configuration/ 子舞台）
+│   └── configuration/         分模块 USD 子舞台：base / physics / robot / sensor
+└── rl/                      强化学习策略（CPG + rsl_rl PPO），详见 rl/README.md
+```
 
 依赖方向单向：`keyboard_detect` → `servo_driver` → `kinematics`；
-`kinematics` 只依赖 Python 标准库。
+`kinematics` 只依赖 Python 标准库。`rl/` 复用 `src/physical_config.json` 与
+`models/hexapod.usd`，与实机共享同一套参数与模型。
+
+训练产物 `rl/logs/` 与 Python 缓存 `__pycache__/` 已被 `.gitignore` 忽略；
+保留的最佳策略位于 `rl/checkpoints/`（入库）。
 
 ## 安装
 
@@ -75,14 +85,14 @@ Linux 下访问串口需要加入 dialout 组（改完重新登录生效）：
 sudo usermod -aG dialout $USER
 ```
 
-`keyboard_detect.py` 依赖全局键盘事件监听，Linux 下需要 root 权限运行。
+`src/keyboard_detect.py` 依赖全局键盘事件监听，Linux 下需要 root 权限运行。
 
 ## 使用
 
 ### 交互控制台
 
 ```bash
-python3 servo_driver.py [--port /dev/ttyUSB0] [--baud 115200] [--time 1500]
+python3 src/servo_driver.py [--port /dev/ttyUSB0] [--baud 115200] [--time 1500]
 ```
 
 | 命令 | 说明 |
@@ -100,7 +110,7 @@ python3 servo_driver.py [--port /dev/ttyUSB0] [--baud 115200] [--time 1500]
 ### 只读位置监视
 
 ```bash
-python3 servo_driver.py --monitor [--port /dev/ttyUSB0] [--baud 115200] [--ids 1-18] [--interval 0]
+python3 src/servo_driver.py --monitor [--port /dev/ttyUSB0] [--baud 115200] [--ids 1-18] [--interval 0]
 ```
 
 `--ids` 支持逗号分隔或区间，例如 `1-18`、`13,14,15`、`1-6,13-18`。
@@ -108,7 +118,7 @@ python3 servo_driver.py --monitor [--port /dev/ttyUSB0] [--baud 115200] [--ids 1
 ### 键盘控制
 
 ```bash
-sudo python3 keyboard_detect.py [--port ...] [--speed ...] [--turn-speed ...]
+sudo python3 src/keyboard_detect.py [--port ...] [--speed ...] [--turn-speed ...]
 ```
 
 W/S/A/D 前后左右，Q/E 逆/顺时针旋转；W+A、W+D、S+A、S+D 斜向组合
@@ -117,7 +127,7 @@ W/S/A/D 前后左右，Q/E 逆/顺时针旋转；W+A、W+D、S+A、S+D 斜向组
 ### IMU 监视器
 
 ```bash
-python3 imu_monitor.py [--port /dev/ttyUSB1] [--baud 115200] [--interval 0] [--plain]
+python3 src/imu_monitor.py [--port /dev/ttyUSB1] [--baud 115200] [--interval 0] [--plain]
 ```
 
 未指定 `--port` 时自动探测 `/dev/ttyUSB*`、`/dev/ttyACM*` 与
@@ -125,10 +135,10 @@ python3 imu_monitor.py [--port /dev/ttyUSB1] [--baud 115200] [--interval 0] [--p
 
 ## 物理参数
 
-所有几何与舵机参数以 `physical_config.json` 为准，代码不另设硬编码副本。
+所有几何与舵机参数以 `src/physical_config.json` 为准，代码不另设硬编码副本。
 修改配置（如腿长度、安装点、关节限位）后无需改代码即可生效；
-`hexapod.urdf` 需重新生成（见文件头部注释）。
-`kinematics.py` 模块 docstring 包含坐标系、角度符号与步态相位约定的完整说明。
+`models/hexapod.urdf` 需重新生成（见文件头部注释）。
+`src/kinematics.py` 模块 docstring 包含坐标系、角度符号与步态相位约定的完整说明。
 
 ## 串口协议
 
@@ -146,13 +156,15 @@ USB 总线模块直连舵机，帧格式
 
 暂无 License 文件；如需引用或复用代码，请先联系作者。
 
-## 强化学习训练（rl/）
+## 强化学习策略（rl/）
 
-同一台机器人的行走策略在 Isaac Lab 中训练（CPG + RL 架构，PPO）：
+同一台机器人的行走策略在 Isaac Lab（2.3.2 + Isaac Sim 5.1）中训练，
+CPG + RL 架构、rsl_rl PPO；训练与展示代码详见 `rl/README.md`。
 
-- `rl/`：训练与展示代码，详见 `rl/README.md`
 - 策略输出 [步幅, 横移, 转角, 抬脚高, 步频, 身高] 6 个参数，
-  可直接喂给本项目的 `TripodGait` 步态管线，实现 sim2real 部署
+  可直接喂给实机 `TripodGait` 步态管线，实现 sim2real 部署
+- 本机为 RTX 5060 单卡；运行前先激活 Isaac Lab 环境：
+  `source /home/tszyi/miniforge3/envs/env_isaaclab/bin/activate`
 
 ```bash
 cd rl && python play_cpg.py --realistic   # 实机同款参数步态演示（需 Isaac Lab 环境）

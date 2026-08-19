@@ -8,5 +8,6 @@ __pycache__/
 # 日志与临时文件
 *.log
 
-# 日志与检查点（可再生成）
+# 训练日志与检查点（可再生，不入库；最佳策略保留在 rl/checkpoints/）
 rl/logs/
+rl/logs_eval/
